@@ -1,0 +1,195 @@
+# Filament Smart Import
+
+A reusable Laravel import engine with an optional Filament 5 Import Hub. Import definitions, validation, staging, previews, writes, queue execution, and progress use one shared Laravel core; the Hub and other adapters call that same core.
+
+> **Development status:** This package is still under development and is not a tagged production release. Use this build in a development or staging application first.
+
+## Requirements
+
+- PHP 8.2 or newer.
+- Laravel 12 or 13.
+- PhpSpreadsheet 5, installed as a package dependency.
+- Filament 5 is optional and required only for the Filament Hub.
+- An asynchronous Laravel queue connection for background imports.
+
+## Install for local development
+
+This workspace build is not a tagged release. Extract the package beside your Laravel application, then merge the following repository and package requirement into the application's existing `composer.json`. Adjust the path to match your folders; keep the app's other dependencies:
+
+```json
+{
+  "repositories": [
+    {
+      "type": "path",
+      "url": "../filament-smart-import",
+      "options": {
+        "symlink": true
+      }
+    }
+  ],
+  "require": {
+    "smart-import/laravel-smart-import": "*"
+  }
+}
+```
+
+Then install the dependency:
+
+```bash
+composer update smart-import/laravel-smart-import
+```
+
+Laravel discovers the package service provider through Composer. Publish the config and run the package migrations:
+
+```bash
+php artisan vendor:publish --tag=smart-import-config
+php artisan migrate
+```
+
+The package migration files are loaded by its service provider. Back up production data and review migrations before applying them to a production database.
+
+## Define an importer
+
+An importer is application code. It declares the target model, fields the import may write, a stable version, an optional matching key, and an explicit write policy.
+
+```php
+<?php
+
+namespace App\Imports;
+
+use App\Models\Contact;
+use SmartImport\Contracts\ImportDefinition;
+use SmartImport\Data\ImportField;
+use SmartImport\Data\ImportWritePolicy;
+use SmartImport\Enums\ImportMode;
+
+final class ContactImportDefinition implements ImportDefinition
+{
+    public function key(): string
+    {
+        return 'contacts';
+    }
+
+    public function version(): string
+    {
+        return '1';
+    }
+
+    public function label(): string
+    {
+        return 'Contacts';
+    }
+
+    public function targetModel(): string
+    {
+        return Contact::class;
+    }
+
+    public function fields(): array
+    {
+        return [
+            new ImportField('name', 'Name', required: true),
+            new ImportField('email', 'Email', required: true, rules: ['email']),
+        ];
+    }
+
+    public function uniqueKeyFields(): array
+    {
+        return ['email'];
+    }
+
+    public function writePolicy(): ImportWritePolicy
+    {
+        return new ImportWritePolicy(ImportMode::Upsert);
+    }
+}
+```
+
+Register only application-owned definitions in `config/smart-import.php`:
+
+```php
+'importers' => [
+    App\Imports\ContactImportDefinition::class,
+],
+```
+
+Increment the definition's `version()` when its fields, validation, transformations, or write behavior changes. See [importer definitions](docs/importer-definitions.md) for aliases, transforms, relationships, blank values, hooks, previews, and sensitive fields.
+
+## Enable the Filament Hub
+
+Install Filament 5 in the host application if it is not already installed. Register the plugin on the intended panel:
+
+```php
+use Filament\Panel;
+use SmartImport\Filament\SmartImportPlugin;
+
+public function panel(Panel $panel): Panel
+{
+    return $panel
+        ->id('admin')
+        ->path('admin')
+        ->plugins([SmartImportPlugin::make()]);
+}
+```
+
+In `config/smart-import.php`, explicitly enable the panel and name the Gate ability that protects it:
+
+```php
+'filament' => [
+    'panels' => [
+        'admin' => 'accessSmartImportHub',
+    ],
+],
+```
+
+Define that ability and the package's operation abilities using your application's roles and tenant rules. Operations include `create`, `viewAny`, `view`, `update`, `queue`, `cancel`, `retry`, `useImporter`, and `export`. Sensitive preview fields can use the optional `viewSensitiveImportFields` ability. Authorization is checked by the shared services as well as the UI.
+
+## Configure storage and queues
+
+Use a private Laravel storage disk for uploaded and discovered files. The defaults use the `local` disk and `smart-import` root. Do not point import storage at a public web directory.
+
+Imports run through Laravel's queue. Configure `smart-import.queue.connection` to an asynchronous queue connection or leave it unset to use `queue.default`. The queue name defaults to `imports`. For a database queue, the host application must have its queue tables installed. Start a worker, for example:
+
+```bash
+php artisan queue:work database --queue=imports --timeout=55 --tries=3
+```
+
+Replace `database` with the configured queue connection. Review [queue worker operation](docs/queue-workers.md) for timeouts, retry behavior, recovery, and Windows development commands.
+
+## Run an import
+
+The Filament Import Inbox is the primary workflow:
+
+1. Upload a CSV, XLSX, or XLS file, or discover a file from the private SFTP inbox.
+2. Assign an authorized importer, select the sheet and header row, and map source columns.
+3. Stage and validate the rows, review the persisted change preview, then explicitly confirm the import.
+4. Follow saved progress in **Active Imports** and inspect completed, failed, or cancelled work in **Import History**.
+
+Uploads and SFTP discovery only register files. Discovery does not select an importer or start an import. See the [Hub guide](docs/filament-hub.md) and [SFTP intake guide](docs/sftp-intake.md) for the complete workflow and restricted-folder setup.
+
+For scheduled or manual SFTP discovery, the package provides:
+
+```bash
+php artisan smart-import:discover --actor=123 --guard=web
+```
+
+The actor must resolve through the selected Laravel guard and pass the configured authorization. The package also provides `php artisan smart-import:recover --dry-run` to inspect stale work and `php artisan smart-import:recover` to recover eligible sessions. It does not install a host scheduler or start queue workers.
+
+## Security notes
+
+- Importers explicitly allowlist target fields; spreadsheet content cannot choose a model or database column.
+- Import files are stored privately, and the Hub does not expose server storage paths.
+- Sensitive before/after values are encrypted in preview storage and require the `viewSensitiveImportFields` Gate to reveal.
+- History exports require the `export` Gate. Formula-like CSV values are neutralized, and sensitive cell values are withheld unless separately authorized.
+- Keep the package tables and imported target models on the same database connection so row writes and import counters can commit atomically.
+
+## Development and known gaps
+
+The repository includes package tests for Laravel 12 and 13 and an isolated Laravel 12 application test suite with Filament 5.
+
+## Documentation
+
+- [Filament Hub](docs/filament-hub.md)
+- [Importer definitions](docs/importer-definitions.md)
+- [SFTP inbox](docs/sftp-intake.md)
+- [Queue workers and recovery](docs/queue-workers.md)

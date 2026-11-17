@@ -1,0 +1,50 @@
+{
+    "name": "smart-import/laravel-smart-import",
+    "description": "A reusable Laravel import engine with an optional Filament 5 adapter.",
+    "type": "library",
+    "keywords": [
+        "laravel",
+        "filament",
+        "import",
+        "spreadsheet"
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/auth": "^12.0 || ^13.0",
+        "illuminate/cache": "^12.0 || ^13.0",
+        "illuminate/console": "^12.0 || ^13.0",
+        "illuminate/contracts": "^12.0 || ^13.0",
+        "illuminate/database": "^12.0 || ^13.0",
+        "illuminate/filesystem": "^12.0 || ^13.0",
+        "illuminate/queue": "^12.0 || ^13.0",
+        "illuminate/support": "^12.0 || ^13.0",
+        "illuminate/validation": "^12.0 || ^13.0",
+        "phpoffice/phpspreadsheet": "^5.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^10.0 || ^11.0",
+        "phpunit/phpunit": "^11.0 || ^12.0 || ^13.0"
+    },
+    "suggest": {
+        "filament/filament": "Install ^5.0 to use the Filament adapter."
+    },
+    "autoload": {
+        "psr-4": {
+            "SmartImport\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SmartImport\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "SmartImport\\SmartImportServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
