@@ -1,0 +1,16 @@
+/vendor/
+/.phpunit.result.cache
+/.phpunit.cache/
+/coverage/
+/build/
+/dist/
+*.zip
+.DS_Store
+
+# Internal development notes are kept in the workspace, not the public package repository.
+/AGENTS.md
+/DECISIONS.md
+/EXECUTION_PLAYBOOK.md
+/FEATURE_MATRIX.md
+/MASTER_PLAN.md
+/PROGRESS.md
