@@ -45,7 +45,7 @@ class ImportStateTransitionTest extends TestCase
             ImportStatus::Importing->value => [ImportStatus::Cancelling, ImportStatus::Completed, ImportStatus::Failed],
             ImportStatus::Cancelling->value => [ImportStatus::Completed, ImportStatus::Cancelled, ImportStatus::Failed],
             ImportStatus::Completed->value => [ImportStatus::Queued],
-            ImportStatus::Failed->value => [ImportStatus::Queued, ImportStatus::Staging],
+            ImportStatus::Failed->value => [ImportStatus::Queued, ImportStatus::Staging, ImportStatus::Completed],
             ImportStatus::Cancelled->value => [ImportStatus::Queued],
         ];
 

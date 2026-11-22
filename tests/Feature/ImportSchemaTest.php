@@ -11,6 +11,9 @@ use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Enums\IntakeStatus;
 use SmartImport\Models\ImportPreset;
+use SmartImport\Models\ImportAuditEntry;
+use SmartImport\Models\ImportNotification;
+use SmartImport\Models\ImportOutboxEvent;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
 use SmartImport\Tests\TestCase;
@@ -25,6 +28,9 @@ class ImportSchemaTest extends TestCase
         $this->assertTrue(Schema::hasTable('smart_imports'));
         $this->assertTrue(Schema::hasTable('smart_import_rows'));
         $this->assertTrue(Schema::hasTable('smart_import_presets'));
+        $this->assertTrue(Schema::hasTable('smart_import_outbox'));
+        $this->assertTrue(Schema::hasTable('smart_import_notifications'));
+        $this->assertTrue(Schema::hasTable('smart_import_audit_entries'));
         $this->assertTrue(Schema::hasColumns('smart_imports', [
             'intake_status',
             'claimed_storage_path',
@@ -33,6 +39,8 @@ class ImportSchemaTest extends TestCase
             'stage_processed',
             'execution_total',
             'attempt_history',
+            'retention_hold_at',
+            'retention_hold_reason',
         ]));
         $this->assertTrue(Schema::hasColumns('smart_import_rows', [
             'validation_status',
@@ -50,6 +58,38 @@ class ImportSchemaTest extends TestCase
             'created_by_type',
             'created_by_id',
         ]));
+        $this->assertTrue(Schema::hasColumns('smart_import_outbox', [
+            'import_id',
+            'attempt_id',
+            'recovery_count',
+            'event_key',
+            'payload_version',
+            'delivery_status',
+            'attempts',
+            'available_at',
+            'lease_token',
+            'lease_expires_at',
+        ]));
+        $this->assertTrue(Schema::hasColumns('smart_import_notifications', [
+            'outbox_id',
+            'notifiable_type',
+            'notifiable_id',
+            'channel',
+            'data',
+            'read_at',
+        ]));
+        $this->assertTrue(Schema::hasColumns('smart_import_audit_entries', [
+            'import_id',
+            'tenant_id',
+            'actor_type',
+            'actor_id',
+            'event',
+            'reason_code',
+            'mapping_revision',
+            'staging_revision',
+            'attempt_id',
+            'metadata',
+        ]));
     }
 
     #[Test]
@@ -58,14 +98,18 @@ class ImportSchemaTest extends TestCase
         $sessions = array_column(Schema::getIndexes('smart_imports'), 'columns');
         $rows = array_column(Schema::getIndexes('smart_import_rows'), 'columns');
         $presets = array_column(Schema::getIndexes('smart_import_presets'), 'columns');
+        $audit = array_column(Schema::getIndexes('smart_import_audit_entries'), 'columns');
 
         $this->assertContains(['file_hash'], $sessions);
         $this->assertContains(['storage_disk', 'claimed_storage_path'], $sessions);
         $this->assertContains(['importer_key', 'status'], $sessions);
         $this->assertContains(['intake_status', 'created_at'], $sessions);
+        $this->assertContains(['created_at', 'id'], $sessions);
         $this->assertContains(['import_id', 'validation_status'], $rows);
         $this->assertContains(['import_id', 'execution_status'], $rows);
         $this->assertContains(['importer_key', 'importer_version'], $presets);
+        $this->assertContains(['import_id', 'created_at'], $audit);
+        $this->assertContains(['import_id', 'id'], $audit);
     }
 
     #[Test]
@@ -117,7 +161,7 @@ class ImportSchemaTest extends TestCase
     #[Test]
     public function package_models_reject_mass_assignment(): void
     {
-        foreach ([new ImportSession(), new ImportRow(), new ImportPreset()] as $model) {
+        foreach ([new ImportSession(), new ImportRow(), new ImportPreset(), new ImportOutboxEvent(), new ImportNotification(), new ImportAuditEntry()] as $model) {
             try {
                 $model->fill([
                     'source' => 'web',

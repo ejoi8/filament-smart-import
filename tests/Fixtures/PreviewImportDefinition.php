@@ -36,6 +36,7 @@ final class PreviewImportDefinition implements ImportDefinition
             new ImportField('email', 'Email', required: true, rules: ['email']),
             new ImportField('api_token', 'API token', sensitive: true),
             new ImportField('department', 'Department'),
+            new ImportField('is_active', 'Active', type: 'boolean'),
         ];
     }
 

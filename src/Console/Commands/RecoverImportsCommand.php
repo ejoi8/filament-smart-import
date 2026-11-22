@@ -37,9 +37,10 @@ final class RecoverImportsCommand extends Command
         }
 
         $this->info(sprintf(
-            'Processed %d stale session(s): %d staging job(s) queued, %d execution recovery(s) queued, %d completed, %d cancelled, %d failed, %d skipped.',
+            'Processed %d stale session(s): %d staging job(s) queued, %d preview job(s) queued, %d execution recovery(s) queued, %d completed, %d cancelled, %d failed, %d skipped.',
             $counts['scanned'],
             $counts['stage_requeued'],
+            $counts['preview_requeued'],
             $counts['execution_requeued'],
             $counts['completed'],
             $counts['cancelled'],

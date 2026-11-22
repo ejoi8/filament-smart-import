@@ -120,6 +120,9 @@
                     'Updated' => 'updated',
                     'Skipped' => 'skipped',
                     'Failed' => 'failed',
+                    'Unchanged' => 'unchanged',
+                    'Excluded' => 'excluded',
+                    'Snapshot conflicts' => 'snapshot_conflicts',
                 ] as $label => $key)
                     <div>
                         <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">{{ $label }}</dt>
@@ -139,6 +142,12 @@
                     </dd>
                 </div>
             </dl>
+        </x-filament::section>
+
+        <x-filament::section heading="Notification delivery">
+            <p class="text-sm text-gray-700 dark:text-gray-200">
+                Latest terminal notification: {{ str($history['notification_delivery_status'])->headline() }}
+            </p>
         </x-filament::section>
 
         <x-filament::section heading="Row results">
@@ -175,6 +184,27 @@
                         </li>
                     @endforeach
                 </ul>
+            </x-filament::section>
+        @endif
+
+        @if ($history['audit'] !== [])
+            <x-filament::section heading="Audit history">
+                <ol class="divide-y divide-gray-200 dark:divide-white/10">
+                    @foreach ($history['audit'] as $entry)
+                        <li class="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                            <div>
+                                <p class="text-sm font-medium text-gray-950 dark:text-white">{{ str($entry['event'])->replace('.', ' · ')->headline() }}</p>
+                                <p class="mt-1 text-xs text-gray-600 dark:text-gray-300">
+                                    {{ $entry['reason_code'] ?? '—' }}
+                                    · {{ $entry['actor_type'] === null ? 'System' : class_basename($entry['actor_type']).' #'.$entry['actor_id'] }}
+                                </p>
+                            </div>
+                            <time class="text-xs text-gray-500 dark:text-gray-400">
+                                {{ $entry['occurred_at'] === null ? '—' : \Illuminate\Support\Carbon::parse($entry['occurred_at'])->format('M j, Y H:i:s') }}
+                            </time>
+                        </li>
+                    @endforeach
+                </ol>
             </x-filament::section>
         @endif
     </div>

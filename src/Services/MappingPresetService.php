@@ -19,6 +19,8 @@ final class MappingPresetService
         private ImportAuthorization $authorization,
         private ImporterRegistry $importers,
         private ColumnMapper $columnMapper,
+        private ImportOptionResolver $importOptions,
+        private SpreadsheetReader $reader,
     ) {}
 
     /**
@@ -54,7 +56,25 @@ final class MappingPresetService
         ksort($storedMapping, SORT_NUMERIC);
 
         $safeOptions = $this->validateOptions($options);
-        $fingerprint = $this->sourceFingerprint($sheetIndex, $sheetName, $headerRow, $headers);
+        $unsupportedOptions = array_diff(array_keys($safeOptions), ['reader', 'importer']);
+
+        if ($unsupportedOptions !== []) {
+            throw new InvalidArgumentException('Mapping presets may contain only reader and importer settings.');
+        }
+
+        $readerOptions = $this->presetReaderOptions($safeOptions);
+        $requestedImporterOptions = $safeOptions['importer'] ?? [];
+
+        if (! is_array($requestedImporterOptions)) {
+            throw new InvalidArgumentException('Mapping preset importer options must be a key/value map.');
+        }
+
+        $safeOptions = [
+            'reader' => $readerOptions,
+            'importer' => $this->importOptions->resolve($definition, $requestedImporterOptions),
+        ];
+
+        $fingerprint = $this->sourceFingerprint($sheetIndex, $sheetName, $headerRow, $headers, $readerOptions);
         $scopeKey = $this->authorization->presetScopeKey($actor);
         $identity = ImportActorIdentity::from($actor);
 
@@ -136,11 +156,13 @@ final class MappingPresetService
         ?int $headerRow,
         array $headers,
         Authenticatable $actor,
+        array $currentOptions = [],
     ): array {
         $definition = $this->definitionFor($importerKey, $actor);
         $this->validateSheetContext($sheetIndex, $sheetName, $headerRow);
         $headers = $this->columnMapper->validateHeaders($headers);
-        $fingerprint = $this->sourceFingerprint($sheetIndex, $sheetName, $headerRow, $headers);
+        $currentReaderOptions = $this->presetReaderOptions($currentOptions);
+        $fingerprint = $this->sourceFingerprint($sheetIndex, $sheetName, $headerRow, $headers, $currentReaderOptions);
 
         $preset = $this->authorization
             ->scopePresets(ImportPreset::query(), $actor)
@@ -150,8 +172,51 @@ final class MappingPresetService
 
         $this->authorization->authorize('view', $actor, $preset);
 
-        $incompatibility = match (true) {
+        $presetOptions = $preset->options ?? [];
+        $incompatibility = null;
+
+        if (! is_array($presetOptions)) {
+            $presetOptions = [];
+            $incompatibility = 'options_invalid';
+        }
+
+        try {
+            if ($incompatibility !== null) {
+                throw new InvalidArgumentException('The saved preset settings are invalid.');
+            }
+
+            $presetOptions = $this->validateOptions($presetOptions);
+            $unsupportedOptions = array_diff(array_keys($presetOptions), ['reader', 'importer']);
+
+            if ($unsupportedOptions !== []) {
+                throw new InvalidArgumentException('The saved preset contains unsupported settings.');
+            }
+
+            $presetReaderOptions = $this->presetReaderOptions($presetOptions);
+        } catch (InvalidArgumentException) {
+            $presetReaderOptions = [];
+            $incompatibility = 'options_invalid';
+        }
+
+        $presetImporterOptions = [];
+
+        if ($incompatibility === null) {
+            try {
+                $requestedImporterOptions = $presetOptions['importer'] ?? [];
+
+                if (! is_array($requestedImporterOptions)) {
+                    throw new InvalidArgumentException('The saved preset importer settings are invalid.');
+                }
+
+                $presetImporterOptions = $this->importOptions->resolve($definition, $requestedImporterOptions);
+            } catch (InvalidArgumentException) {
+                $incompatibility = 'importer_options';
+            }
+        }
+
+        $incompatibility ??= match (true) {
             $preset->importer_version !== $definition->version() => 'importer_version',
+            $presetReaderOptions !== $currentReaderOptions => 'reader_options',
             ! hash_equals($preset->source_fingerprint, $fingerprint) => 'source_fingerprint',
             default => null,
         };
@@ -169,11 +234,8 @@ final class MappingPresetService
         }
 
         if ($incompatibility === null) {
-            try {
-                $this->validateOptions($preset->options ?? []);
-            } catch (InvalidArgumentException) {
-                $incompatibility = 'options_invalid';
-            }
+            $presetOptions['reader'] = $presetReaderOptions;
+            $presetOptions['importer'] = $presetImporterOptions;
         }
 
         return [
@@ -183,7 +245,7 @@ final class MappingPresetService
             'compatible' => $incompatibility === null,
             'incompatibility' => $incompatibility,
             'mapping' => $incompatibility === null ? $preset->mapping : null,
-            'options' => $incompatibility === null ? $preset->options : null,
+            'options' => $incompatibility === null ? $presetOptions : null,
         ];
     }
 
@@ -270,7 +332,13 @@ final class MappingPresetService
     /**
      * @param array<int, string|int|float|bool|null> $headers
      */
-    private function sourceFingerprint(int $sheetIndex, string $sheetName, ?int $headerRow, array $headers): string
+    private function sourceFingerprint(
+        int $sheetIndex,
+        string $sheetName,
+        ?int $headerRow,
+        array $headers,
+        array $readerOptions,
+    ): string
     {
         $columns = [];
 
@@ -284,10 +352,11 @@ final class MappingPresetService
 
         try {
             $payload = json_encode([
-                'signature_version' => 1,
+                'signature_version' => 2,
                 'sheet_index' => $sheetIndex,
                 'sheet_name' => $sheetName,
                 'header_row' => $headerRow,
+                'reader_options' => $readerOptions,
                 'columns' => $columns,
             ], JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
         } catch (JsonException $exception) {
@@ -295,5 +364,30 @@ final class MappingPresetService
         }
 
         return hash('sha256', $payload);
+    }
+
+    /** @return array{csv_delimiter: ?string, csv_encoding: string} */
+    private function presetReaderOptions(array $options): array
+    {
+        $readerOptions = $options['reader'] ?? [];
+
+        if (! is_array($readerOptions)) {
+            throw new InvalidArgumentException('Mapping preset reader options must be a key/value map.');
+        }
+
+        $allowed = ['csv_delimiter', 'csv_encoding'];
+
+        if (array_diff(array_keys($readerOptions), $allowed) !== []) {
+            throw new InvalidArgumentException('Mapping preset reader options contain an unsupported setting.');
+        }
+
+        $delimiter = $readerOptions['csv_delimiter'] ?? null;
+        $encoding = $readerOptions['csv_encoding'] ?? \PhpOffice\PhpSpreadsheet\Reader\Csv::GUESS_ENCODING;
+
+        if (($delimiter !== null && ! is_string($delimiter)) || ! is_string($encoding)) {
+            throw new InvalidArgumentException('Mapping preset CSV options must use a string delimiter and encoding.');
+        }
+
+        return $this->reader->normalizeCsvOptions($delimiter, $encoding);
     }
 }

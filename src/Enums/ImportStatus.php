@@ -24,7 +24,7 @@ enum ImportStatus: string
             self::Importing => [self::Cancelling, self::Completed, self::Failed],
             self::Cancelling => [self::Completed, self::Cancelled, self::Failed],
             self::Completed, self::Cancelled => [self::Queued],
-            self::Failed => [self::Queued, self::Staging],
+            self::Failed => [self::Queued, self::Staging, self::Completed],
         }, true);
     }
 }

@@ -17,6 +17,7 @@ use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Events\ImportFinished;
 use SmartImport\Jobs\ExecuteImportChunkJob;
+use SmartImport\Jobs\GenerateImportPreviewJob;
 use SmartImport\Jobs\StageImportJob;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
@@ -30,6 +31,7 @@ use SmartImport\Services\ImporterRegistry;
 use SmartImport\Services\StagedRowService;
 use SmartImport\Tests\Fixtures\SkipPreviewImportDefinition;
 use SmartImport\Tests\Fixtures\ImportTargetModel;
+use SmartImport\Tests\Fixtures\InvalidRowExclusionImportDefinition;
 use SmartImport\Tests\Fixtures\PreviewImportDefinition;
 use SmartImport\Tests\TestCase;
 
@@ -47,6 +49,7 @@ class ImportPreviewServiceTest extends TestCase
             $table->string('email')->nullable();
             $table->string('api_token')->nullable();
             $table->string('department')->nullable();
+            $table->boolean('is_active')->default(false);
             $table->timestamps();
         });
 
@@ -276,11 +279,11 @@ class ImportPreviewServiceTest extends TestCase
 
         $service->generate((string) $session->getKey(), $actor);
         $this->app->make(StagedRowService::class)
-            ->edit((string) $session->getKey(), $session->rows()->firstOrFail()->id, 'name', 'Corrected contact', $actor);
+            ->edit((string) $session->getKey(), $session->rows()->firstOrFail()->id, 'name', 'Corrected contact', $actor, (int) $session->staging_revision);
 
         $this->assertNull($session->rows()->firstOrFail()->fresh()->preview);
         try {
-            $service->confirm((string) $session->getKey(), $actor);
+            $service->confirm((string) $session->getKey(), $actor, (int) $session->fresh()->staging_revision);
             $this->fail('A preview invalidated by an edit cannot be confirmed.');
         } catch (\DomainException $exception) {
             $this->assertStringContainsString('complete preview', $exception->getMessage());
@@ -291,6 +294,24 @@ class ImportPreviewServiceTest extends TestCase
     }
 
     #[Test]
+    public function sensitive_staged_cells_require_a_separate_edit_ability(): void
+    {
+        Gate::define('editSensitiveImportFields', static fn (): bool => false);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-TOKEN,Sales\n", $actor);
+
+        $this->expectException(AuthorizationException::class);
+        app(StagedRowService::class)->edit(
+            (string) $session->getKey(),
+            $session->rows()->firstOrFail()->id,
+            'api_token',
+            'CHANGED-PRIVATE-TOKEN',
+            $actor,
+            (int) $session->staging_revision,
+        );
+    }
+
+    #[Test]
     public function confirmation_freezes_the_previewed_revision_and_queued_rows_cannot_be_edited(): void
     {
         $actor = new GenericUser(['id' => 7]);
@@ -298,7 +319,7 @@ class ImportPreviewServiceTest extends TestCase
         $service = $this->app->make(ImportPreviewService::class);
         $service->generate((string) $session->getKey(), $actor);
 
-        $queued = $service->confirm((string) $session->getKey(), $actor);
+        $queued = $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
 
         $this->assertSame(ImportStatus::Queued, $queued->status);
         $this->assertSame(1, $queued->confirmed_revision);
@@ -316,7 +337,7 @@ class ImportPreviewServiceTest extends TestCase
 
         try {
             $this->app->make(StagedRowService::class)
-                ->edit((string) $session->getKey(), $session->rows()->firstOrFail()->id, 'name', 'Changed', $actor);
+                ->edit((string) $session->getKey(), $session->rows()->firstOrFail()->id, 'name', 'Changed', $actor, (int) $session->staging_revision);
             $this->fail('A queued import row cannot be edited.');
         } catch (\DomainException $exception) {
             $this->assertStringContainsString('only while the import is ready', $exception->getMessage());
@@ -347,7 +368,7 @@ class ImportPreviewServiceTest extends TestCase
         $service = $this->app->make(ImportPreviewService::class);
 
         try {
-            $service->confirm((string) $session->getKey(), $actor);
+            $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
             $this->fail('A session without preview data cannot be confirmed.');
         } catch (\DomainException $exception) {
             $this->assertStringContainsString('complete preview', $exception->getMessage());
@@ -357,7 +378,129 @@ class ImportPreviewServiceTest extends TestCase
         Gate::define('queue', fn (): bool => false);
 
         $this->expectException(AuthorizationException::class);
-        $service->confirm((string) $session->getKey(), $actor);
+        $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
+    }
+
+    #[Test]
+    public function confirmation_rechecks_importer_permission_after_preview_generation(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nNew contact,new@example.test,secret,Sales\n", $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+        Gate::define('useImporter', fn (): bool => false);
+
+        try {
+            $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
+            $this->fail('Importer permission must be checked again at confirmation.');
+        } catch (AuthorizationException) {
+            $this->assertSame(ImportStatus::ReviewReady, $session->fresh()->status);
+            Queue::assertNotPushed(ExecuteImportChunkJob::class);
+        }
+    }
+
+    #[Test]
+    public function invalid_staged_rows_block_confirmation_by_default(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\n,not-an-email,secret,Sales\n", $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+        $summary = $service->generate((string) $session->getKey(), $actor);
+
+        $this->assertSame(1, $summary['fail']);
+
+        try {
+            $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
+            $this->fail('Invalid staged rows must block confirmation by default.');
+        } catch (\DomainException $exception) {
+            $this->assertStringContainsString('invalid', strtolower($exception->getMessage()));
+            $this->assertSame(ImportStatus::ReviewReady, $session->fresh()->status);
+            Queue::assertNotPushed(ExecuteImportChunkJob::class);
+        }
+    }
+
+    #[Test]
+    public function a_stale_review_revision_cannot_confirm_a_newer_preview(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nNew contact,new@example.test,secret,Sales\n", $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+        $reviewedRevision = $session->staging_revision;
+        $row = $session->rows()->firstOrFail();
+        $this->app->make(StagedRowService::class)
+            ->edit((string) $session->getKey(), $row->id, 'name', 'Corrected contact', $actor, (int) $session->staging_revision);
+        $service->generate((string) $session->getKey(), $actor);
+
+        try {
+            $service->confirm((string) $session->getKey(), $actor, $reviewedRevision);
+            $this->fail('A stale browser review must not confirm a newer staging revision.');
+        } catch (\DomainException $exception) {
+            $this->assertStringContainsString('changed after you reviewed it', $exception->getMessage());
+            $this->assertSame(ImportStatus::ReviewReady, $session->fresh()->status);
+        }
+    }
+
+    #[Test]
+    public function preview_generation_requires_the_session_update_ability(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nNew contact,new@example.test,secret,Sales\n", $actor);
+        Gate::define('update', fn (): bool => false);
+
+        $this->expectException(AuthorizationException::class);
+        $this->app->make(ImportPreviewService::class)->generate((string) $session->getKey(), $actor);
+    }
+
+    #[Test]
+    public function importer_capability_allows_explicit_exclusion_of_invalid_rows(): void
+    {
+        config()->set('smart-import.importers', [InvalidRowExclusionImportDefinition::class]);
+        $this->app->forgetInstance(ImporterRegistry::class);
+        $this->app->forgetInstance(ImportCoordinator::class);
+        $this->app->forgetInstance(FileIntakeService::class);
+        $this->app->forgetInstance(ImportStagingService::class);
+        $this->app->forgetInstance(ImportPreviewService::class);
+
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage(
+            "Name,Email,API token,Department\nValid contact,valid@example.test,token,Sales\n,invalid-email,token,Support\n",
+            $actor,
+            'preview-contacts-with-invalid-exclusion',
+        );
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+
+        $confirmed = $service->confirm((string) $session->getKey(), $actor, $session->staging_revision, excludeInvalidRows: true);
+        $rows = $confirmed->rows()->orderBy('source_row_number')->get();
+
+        $this->assertSame(1, $confirmed->execution_total);
+        $this->assertSame(true, $confirmed->options['exclude_invalid_rows']);
+        $this->assertSame(1, $confirmed->options['excluded_invalid_row_count']);
+        $this->assertSame(['pending', 'excluded'], $rows->pluck('execution_status')->all());
+        Queue::assertPushed(ExecuteImportChunkJob::class, fn (ExecuteImportChunkJob $job): bool =>
+            count($job->rowIds) === 1 && $job->rowIds === [$rows[0]->id]
+        );
+    }
+
+    #[Test]
+    public function an_importer_cannot_exclude_every_invalid_row_into_an_empty_attempt(): void
+    {
+        config()->set('smart-import.importers', [InvalidRowExclusionImportDefinition::class]);
+        $this->app->forgetInstance(ImporterRegistry::class);
+        $this->app->forgetInstance(ImportCoordinator::class);
+        $this->app->forgetInstance(FileIntakeService::class);
+        $this->app->forgetInstance(ImportStagingService::class);
+        $this->app->forgetInstance(ImportPreviewService::class);
+
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\n,invalid-email,token,Support\n", $actor, 'preview-contacts-with-invalid-exclusion');
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+
+        $this->expectException(\DomainException::class);
+        $this->expectExceptionMessage('No valid staged rows remain');
+        $service->confirm((string) $session->getKey(), $actor, $session->staging_revision, excludeInvalidRows: true);
     }
 
     #[Test]
@@ -371,7 +514,7 @@ class ImportPreviewServiceTest extends TestCase
         );
         $service = $this->app->make(ImportPreviewService::class);
         $service->generate((string) $session->getKey(), $actor);
-        $queued = $service->confirm((string) $session->getKey(), $actor);
+        $queued = $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
         $jobs = Queue::pushed(ExecuteImportChunkJob::class)->all();
         $chunkSizes = array_map(static fn (ExecuteImportChunkJob $job): int => count($job->rowIds), $jobs);
         sort($chunkSizes);
@@ -400,7 +543,7 @@ class ImportPreviewServiceTest extends TestCase
         );
         $previews = $this->app->make(ImportPreviewService::class);
         $previews->generate((string) $session->getKey(), $actor);
-        $queued = $previews->confirm((string) $session->getKey(), $actor);
+        $queued = $previews->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
         $jobs = Queue::pushed(ExecuteImportChunkJob::class)->all();
         Event::fake([ImportFinished::class]);
         $execution = $this->app->make(ImportExecutionService::class);
@@ -446,7 +589,7 @@ class ImportPreviewServiceTest extends TestCase
         $this->app->detectEnvironment(static fn (): string => 'production');
 
         try {
-            $service->confirm((string) $session->getKey(), $actor);
+            $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
             $this->fail('A real asynchronous import cannot use Laravel sync queue.');
         } catch (\DomainException $exception) {
             $this->assertStringContainsString('sync driver would block', $exception->getMessage());
@@ -491,10 +634,109 @@ class ImportPreviewServiceTest extends TestCase
         $this->assertDatabaseCount('import_target_models', 1);
     }
 
+    #[Test]
+    public function boolean_field_with_database_one_is_previewed_as_unchanged_for_csv_one(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 1,
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage(
+            "Name,Email,Active\nExisting contact,active@example.test,1\n",
+            $actor,
+            mapping: [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+
+        $service = app(ImportPreviewService::class);
+        $summary = $service->generate((string) $session->getKey(), $actor);
+        $row = $service->rows((string) $session->getKey(), $actor)['rows'][0];
+
+        $this->assertSame(1, $summary['skip']);
+        $this->assertSame(0, $summary['update']);
+        $this->assertSame('unchanged', $row['preview']['reason']);
+        $this->assertSame([], $row['preview']['changes']);
+        $this->assertSame(1, $target->fresh()->getRawOriginal('is_active'));
+    }
+
+    #[Test]
+    public function a_real_boolean_value_change_remains_an_update_in_preview(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 0,
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage(
+            "Name,Email,Active\nExisting contact,active@example.test,1\n",
+            $actor,
+            mapping: [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+
+        $service = app(ImportPreviewService::class);
+        $summary = $service->generate((string) $session->getKey(), $actor);
+        $row = $service->rows((string) $session->getKey(), $actor)['rows'][0];
+
+        $this->assertSame(1, $summary['update']);
+        $this->assertSame('update', $row['preview']['action']);
+        $this->assertSame(0, $target->fresh()->getRawOriginal('is_active'));
+    }
+
+    #[Test]
+    public function large_preview_is_queued_and_persists_progress_before_confirmation(): void
+    {
+        config()->set('smart-import.preview.async_threshold_rows', 1);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,secret,Sales\n", $actor);
+        $service = app(ImportPreviewService::class);
+
+        $result = $service->generateOrQueue((string) $session->getKey(), $actor, (int) $session->staging_revision);
+        $building = $session->fresh();
+        $job = Queue::pushed(GenerateImportPreviewJob::class)->first();
+
+        $this->assertTrue($result['queued']);
+        $this->assertFalse($result['already_queued']);
+        $this->assertNull($result['summary']);
+        $this->assertSame('building', $building->options['preview_state']);
+        $this->assertSame(0, $building->options['preview_processed']);
+        $this->assertSame(1, $building->options['preview_total']);
+        $this->assertNotNull($job);
+        $this->assertSame((string) $building->getKey(), $job->sessionId);
+        $this->assertSame($building->mapping_revision, $job->mappingRevision);
+        $this->assertSame($building->staging_revision, $job->stagingRevision);
+
+        $job->handle($service);
+        $ready = $session->fresh();
+        $this->assertSame('ready', $ready->options['preview_state']);
+        $this->assertSame(1, $ready->options['preview_processed']);
+        $this->assertSame(1, $ready->options['preview_summary']['create']);
+        $this->assertSame('create', $service->rows((string) $session->getKey(), $actor)['rows'][0]['preview']['action']);
+        $this->assertSame(0, ImportTargetModel::query()->count(), 'Preview generation must not write target records.');
+    }
+
+    #[Test]
+    public function repeated_large_preview_requests_share_the_current_durable_generation(): void
+    {
+        config()->set('smart-import.preview.async_threshold_rows', 1);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,secret,Sales\n", $actor);
+        $service = app(ImportPreviewService::class);
+
+        $first = $service->generateOrQueue((string) $session->getKey(), $actor, (int) $session->staging_revision);
+        $second = $service->generateOrQueue((string) $session->getKey(), $actor, (int) $session->staging_revision);
+
+        $this->assertFalse($first['already_queued']);
+        $this->assertTrue($second['already_queued']);
+        Queue::assertPushed(GenerateImportPreviewJob::class, 1);
+    }
+
     private function stage(
         string $contents,
         GenericUser $actor,
         string $importerKey = 'preview-contacts',
+        array $mapping = [1 => 'name', 2 => 'email', 3 => 'api_token', 4 => 'department'],
     ): \SmartImport\Models\ImportSession
     {
         $file = UploadedFile::fake()->createWithContent('contacts.csv', $contents);
@@ -505,7 +747,7 @@ class ImportPreviewServiceTest extends TestCase
             $importerKey,
             0,
             1,
-            [1 => 'name', 2 => 'email', 3 => 'api_token', 4 => 'department'],
+            $mapping,
         );
 
         (new StageImportJob((string) $session->getKey(), 1, 1))->handle($this->app->make(ImportStagingService::class));

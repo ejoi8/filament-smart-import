@@ -50,4 +50,4 @@ use Illuminate\Support\Facades\Schedule;
 Schedule::command('smart-import:discover --actor=123 --guard=web')->everyMinute();
 ```
 
-Quarantine and lifecycle log entries contain sanitized filenames/reasons and no storage paths or spreadsheet cell values. Retention cleanup is not currently automatic; source files remain in private storage until a future, explicitly configured retention task is implemented.
+Quarantine and lifecycle log entries contain sanitized filenames/reasons and no storage paths or spreadsheet cell values. Retention cleanup is not automatic. Use the inspection-only [`smart-import:retention-dry-run`](audit-retention.md) report to review eligible objects and protected sessions; the package never removes them.

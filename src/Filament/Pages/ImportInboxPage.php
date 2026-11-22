@@ -20,6 +20,7 @@ use Illuminate\Contracts\Auth\Access\Gate;
 use Illuminate\Database\Eloquent\Builder;
 use DomainException;
 use InvalidArgumentException;
+use Livewire\Attributes\Url;
 use RuntimeException;
 use SmartImport\Enums\IntakeStatus;
 use SmartImport\Enums\ImportStatus;
@@ -34,6 +35,9 @@ use Symfony\Component\HttpFoundation\File\UploadedFile;
 final class ImportInboxPage extends ImportHubPage implements HasTable
 {
     use InteractsWithTable;
+
+    #[Url(as: 'importer')]
+    public ?string $preferredImporterKey = null;
 
     protected static ?string $slug = 'import-inbox';
 
@@ -116,6 +120,7 @@ final class ImportInboxPage extends ImportHubPage implements HasTable
                         Select::make('importer_key')
                             ->label('Importer')
                             ->options(fn (): array => $this->authorizedImporterOptions())
+                            ->default(fn (): ?string => $this->authorizedPreferredImporter())
                             ->required()
                             ->searchable(),
                     ])
@@ -134,6 +139,11 @@ final class ImportInboxPage extends ImportHubPage implements HasTable
                     ->icon(Heroicon::OutlinedAdjustmentsHorizontal)
                     ->url(fn (ImportSession $record): string => ImportMappingPage::getUrl(['session' => $record->getKey()]))
                     ->visible(fn (ImportSession $record): bool => $this->canConfigure($record)),
+                Action::make('reviewImport')
+                    ->label('Review import')
+                    ->icon(Heroicon::OutlinedEye)
+                    ->url(fn (ImportSession $record): string => ImportReviewPage::getUrl(['session' => $record->getKey()]))
+                    ->visible(fn (ImportSession $record): bool => $this->canReview($record)),
                 Action::make('viewProgress')
                     ->label('View progress')
                     ->icon(Heroicon::OutlinedChartBar)
@@ -308,6 +318,24 @@ final class ImportInboxPage extends ImportHubPage implements HasTable
             && $gate->allows('useImporter', $registry->get($record->importer_key));
     }
 
+    private function canReview(ImportSession $record): bool
+    {
+        if ($record->status !== ImportStatus::ReviewReady || $record->importer_key === null) {
+            return false;
+        }
+
+        $registry = app(ImporterRegistry::class);
+
+        if (! $registry->has($record->importer_key)) {
+            return false;
+        }
+
+        $gate = app(Gate::class)->forUser($this->actor());
+
+        return $gate->allows('view', $record)
+            && $gate->allows('useImporter', $registry->get($record->importer_key));
+    }
+
     private function canReject(ImportSession $record): bool
     {
         return in_array($record->status, [null, ImportStatus::ReviewReady], true)
@@ -336,6 +364,17 @@ final class ImportInboxPage extends ImportHubPage implements HasTable
         }
 
         return $options;
+    }
+
+    private function authorizedPreferredImporter(): ?string
+    {
+        if (! is_string($this->preferredImporterKey) || $this->preferredImporterKey === '') {
+            return null;
+        }
+
+        return array_key_exists($this->preferredImporterKey, $this->authorizedImporterOptions())
+            ? $this->preferredImporterKey
+            : null;
     }
 
     private function emptyStateHeading(): string

@@ -13,6 +13,7 @@ final readonly class ImportWritePolicy
         public ImportMode $mode,
         public ?WriteConflictPolicy $insertConflict = null,
         public ?WriteConflictPolicy $missingUpdateTarget = null,
+        public bool $allowInvalidRowExclusion = false,
     ) {
         if (($mode === ImportMode::Insert) !== ($insertConflict !== null)) {
             throw new InvalidArgumentException('Insert mode requires an explicit insert conflict policy, and other modes cannot set one.');

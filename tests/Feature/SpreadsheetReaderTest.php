@@ -55,6 +55,68 @@ class SpreadsheetReaderTest extends TestCase
     }
 
     #[Test]
+    public function automatic_delimiter_detection_reads_a_bounded_header_sample(): void
+    {
+        $session = $this->uploadCsv("Name;Code\nAda;0012\n");
+        $reader = $this->reader();
+
+        $this->assertSame(2, $reader->listSheets($session)[0]['columns']);
+        $rows = iterator_to_array($reader->readRows($session, 0), false);
+        $this->assertSame([1 => 'Name', 2 => 'Code'], $rows[0]['values']);
+        $this->assertSame([1 => 'Ada', 2 => '0012'], $rows[1]['values']);
+    }
+
+    #[Test]
+    public function streamed_csv_reading_preserves_quoted_newlines_delimiters_blank_rows_and_start_positions(): void
+    {
+        $session = $this->uploadCsv("Name,Code,Notes\nAda,0012,\"first line\nsecond, line\"\n,,\nGrace,0007,\n");
+        $rows = iterator_to_array($this->reader()->readRows($session, 0, startRow: 2), false);
+
+        $this->assertSame([2, 4], array_column($rows, 'row_number'));
+        $this->assertSame('0012', $rows[0]['values'][2]);
+        $this->assertSame("first line\nsecond, line", $rows[0]['values'][3]);
+        $this->assertSame([1 => 'Grace', 2 => '0007', 3 => ''], $rows[1]['values']);
+    }
+
+    #[Test]
+    public function streamed_csv_reading_skips_separator_directives_and_converts_selected_encodings(): void
+    {
+        $encoded = iconv('UTF-8', 'Windows-1252', "sep=;\nCity;Code\nMontréal;0012\n");
+        self::assertIsString($encoded);
+        $session = $this->uploadCsv($encoded);
+
+        $rows = iterator_to_array($this->reader()->readRows($session, 0, csvEncoding: 'Windows-1252'), false);
+
+        $this->assertSame([1, 2], array_column($rows, 'row_number'));
+        $this->assertSame([1 => 'City', 2 => 'Code'], $rows[0]['values']);
+        $this->assertSame([1 => 'Montréal', 2 => '0012'], $rows[1]['values']);
+    }
+
+    #[Test]
+    public function streamed_csv_reading_removes_a_utf8_byte_order_mark(): void
+    {
+        $session = $this->uploadCsv("\xEF\xBB\xBFName,Code\nAda,0012\n");
+        $rows = iterator_to_array($this->reader()->readRows($session, 0), false);
+
+        $this->assertSame('Name', $rows[0]['values'][1]);
+        $this->assertSame([1, 2], array_column($rows, 'row_number'));
+    }
+
+    #[Test]
+    public function streamed_csv_reading_converts_utf16le_with_a_byte_order_mark(): void
+    {
+        $contents = iconv('UTF-8', 'UTF-16LE', "City;Code\nMontréal;0012\n");
+        self::assertIsString($contents);
+        $session = $this->uploadCsv("\xFF\xFE".$contents);
+
+        $rows = iterator_to_array($this->reader()->readRows($session, 0), false);
+
+        $this->assertSame([1, 2], array_column($rows, 'row_number'));
+        $this->assertSame([1 => 'City', 2 => 'Code'], $rows[0]['values']);
+        $this->assertSame([1 => 'Montréal', 2 => '0012'], $rows[1]['values']);
+    }
+
+    #[Test]
     public function preview_supports_manual_delimiters_and_header_rows_below_introductory_lines(): void
     {
         $session = $this->uploadCsv("Monthly report\nCreated by Smart Import\nName;Code\nAda;0012\nGrace;0007\n");
@@ -154,6 +216,27 @@ class SpreadsheetReaderTest extends TestCase
             $this->fail('Unsupported CSV encodings must be rejected.');
         } catch (\InvalidArgumentException $exception) {
             $this->assertStringContainsString('CSV input encoding is invalid', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function csv_delimiter_and_encoding_choices_must_be_enabled_by_package_configuration(): void
+    {
+        config()->set('smart-import.reading.csv_delimiters', [',' => 'Comma']);
+        config()->set('smart-import.reading.csv_encodings', ['UTF-8']);
+
+        try {
+            $this->reader()->normalizeCsvOptions(';', 'UTF-8');
+            $this->fail('A delimiter removed by host configuration must not be accepted.');
+        } catch (\InvalidArgumentException $exception) {
+            $this->assertStringContainsString('not enabled by package configuration', $exception->getMessage());
+        }
+
+        try {
+            $this->reader()->normalizeCsvOptions(',', 'Windows-1252');
+            $this->fail('An encoding removed by host configuration must not be accepted.');
+        } catch (\InvalidArgumentException $exception) {
+            $this->assertStringContainsString('not enabled by package configuration', $exception->getMessage());
         }
     }
 

@@ -32,6 +32,7 @@ class ImportSession extends Model
         'sheet_index',
         'sheet_header_row',
         'mapping',
+        'options',
         'mapping_revision',
         'staging_revision',
         'confirmed_revision',
@@ -117,6 +118,7 @@ class ImportSession extends Model
             'started_at' => 'immutable_datetime',
             'heartbeat_at' => 'immutable_datetime',
             'finished_at' => 'immutable_datetime',
+            'retention_hold_at' => 'immutable_datetime',
         ];
     }
 
@@ -133,6 +135,11 @@ class ImportSession extends Model
     public function possibleDuplicates(): HasMany
     {
         return $this->hasMany(self::class, 'possible_duplicate_of');
+    }
+
+    public function auditEntries(): HasMany
+    {
+        return $this->hasMany(ImportAuditEntry::class, 'import_id', 'id');
     }
 
     public function transitionTo(ImportStatus $next): void

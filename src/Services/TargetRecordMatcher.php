@@ -11,6 +11,8 @@ final class TargetRecordMatcher
 {
     private const QUERY_PARAMETER_BUDGET = 800;
 
+    public function __construct(private ImportIndexHasher $indexHasher) {}
+
     /**
      * Find existing target rows for a bounded set of normalized import rows.
      *
@@ -148,22 +150,38 @@ final class TargetRecordMatcher
     /** @param array<string, mixed> $normalizedValues */
     public function matchesKey(ImportDefinition $definition, array $normalizedValues, Model $target): bool
     {
-        foreach ($definition->uniqueKeyFields() as $fieldName) {
-            if (! array_key_exists($fieldName, $normalizedValues)) {
-                return false;
-            }
+        $fields = $definition->uniqueKeyFields();
+        $sourceKey = $this->completeKey($fields, $normalizedValues);
+        $targetValues = [];
 
-            $sourceValue = $normalizedValues[$fieldName];
-            $targetValue = $target->getRawOriginal($fieldName);
-
-            if ((! is_string($sourceValue) && ! is_int($sourceValue) && ! is_float($sourceValue) && ! is_bool($sourceValue))
-                || (! is_string($targetValue) && ! is_int($targetValue) && ! is_float($targetValue) && ! is_bool($targetValue))
-                || (string) $sourceValue !== (string) $targetValue) {
-                return false;
-            }
+        foreach ($fields as $fieldName) {
+            $targetValues[$fieldName] = $target->getRawOriginal($fieldName);
         }
 
-        return true;
+        $targetKey = $this->completeKey($fields, $targetValues);
+
+        return $sourceKey !== null
+            && $targetKey !== null
+            && $this->signature($sourceKey) === $this->signature($targetKey);
+    }
+
+    /** Return the canonical hash used for both target matching and file duplicate detection. */
+    public function keyHash(ImportDefinition $definition, array $normalizedValues, int $version = ImportIndexHasher::CURRENT_VERSION): ?string
+    {
+        $key = $this->completeKey($definition->uniqueKeyFields(), $normalizedValues);
+
+        if ($key === null) {
+            return null;
+        }
+
+        foreach ($key as $fieldName => $value) {
+            $key[$fieldName] = is_bool($value) ? ($value ? '1' : '0') : (string) $value;
+        }
+
+        return $this->indexHasher->hash(
+            json_encode($key, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR),
+            $version,
+        );
     }
 
     /** @param list<string> $keyFields
@@ -198,7 +216,7 @@ final class TargetRecordMatcher
     private function signature(array $key): string
     {
         foreach ($key as $fieldName => $value) {
-            $key[$fieldName] = (string) $value;
+            $key[$fieldName] = is_bool($value) ? ($value ? '1' : '0') : (string) $value;
         }
 
         return hash('sha256', json_encode($key, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR));

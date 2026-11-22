@@ -1,10 +1,16 @@
 <x-filament-panels::page>
+    @php($pollSeconds = max(1, min(60, (int) config('smart-import.progress.polling_interval_seconds', 2))))
     @if ($shouldPoll)
-        <div wire:poll.2s="refreshProgress" class="space-y-6">
+        <div wire:poll.{{ $pollSeconds }}s="refreshProgress" class="space-y-6">
     @else
         <div class="space-y-6">
     @endif
         <x-filament::section heading="Import status">
+            @if ($progress['no_recent_heartbeat'] ?? false)
+                <p class="mb-4 text-sm text-warning-700 dark:text-warning-300" role="status">
+                    There has been no recent progress update. The queue may be delayed or a worker may need attention; this page cannot determine worker presence.
+                </p>
+            @endif
             <dl class="grid gap-4 sm:grid-cols-2">
                 <div>
                     <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">File</dt>

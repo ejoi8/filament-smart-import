@@ -165,6 +165,62 @@ final class ColumnMapper
     }
 
     /**
+     * Find a likely header row only when it maps enough importer fields and includes every required field.
+     * Ties prefer the earlier row in the supplied sample.
+     *
+     * @param list<array{row_number: int, values: array<int, mixed>}> $sampleRows
+     * @return array{row_number: int, matched_fields: list<string>, required_fields_matched: int, exact_matches: int}|null
+     */
+    public function detectHeaderRow(ImportDefinition $definition, array $sampleRows): ?array
+    {
+        $fields = $this->fieldsByName($definition);
+        $requiredFields = array_keys(array_filter(
+            $fields,
+            static fn (ImportField $field): bool => $field->required,
+        ));
+        $minimumMatches = min(2, count($fields));
+        $best = null;
+        $bestScore = null;
+
+        foreach ($sampleRows as $row) {
+            if (! is_array($row)
+                || ! is_int($row['row_number'] ?? null)
+                || $row['row_number'] < 1
+                || ! is_array($row['values'] ?? null)) {
+                continue;
+            }
+
+            $suggestions = $this->suggest($definition, $row['values']);
+            $matchedFields = array_values($suggestions['mapping']);
+            $requiredMatched = count(array_intersect($requiredFields, $matchedFields));
+
+            if (count($matchedFields) < $minimumMatches || $requiredMatched !== count($requiredFields)) {
+                continue;
+            }
+
+            $exactMatches = count(array_filter(
+                $suggestions['columns'],
+                static fn (array $column): bool => $column['status'] === 'suggested' && $column['match_type'] === 'exact',
+            ));
+            $score = [$requiredMatched, count($matchedFields), $exactMatches];
+
+            if ($bestScore !== null && $score <= $bestScore) {
+                continue;
+            }
+
+            $bestScore = $score;
+            $best = [
+                'row_number' => $row['row_number'],
+                'matched_fields' => $matchedFields,
+                'required_fields_matched' => $requiredMatched,
+                'exact_matches' => $exactMatches,
+            ];
+        }
+
+        return $best;
+    }
+
+    /**
      * Validate a complete manual choice for every source column. A null choice explicitly ignores a column.
      *
      * @param array<int, string|int|float|bool|null> $headers

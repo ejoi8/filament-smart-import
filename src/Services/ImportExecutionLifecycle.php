@@ -6,6 +6,7 @@ use DomainException;
 use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Events\ImportFinished;
 use SmartImport\Models\ImportSession;
@@ -17,6 +18,9 @@ final class ImportExecutionLifecycle
         private ImporterRegistry $importers,
         private ImportHookDispatcher $hooks,
         private ImportAuthorization $authorization,
+        private ImportExecutionContext $executionContext,
+        private ImportOutboxService $outbox,
+        private ImportAuditService $audit,
     ) {}
 
     /** Request cancellation through the actor-scoped session boundary. */
@@ -48,6 +52,10 @@ final class ImportExecutionLifecycle
             $session->forceFill([
                 'cancel_requested_at' => $session->cancel_requested_at ?? $now,
                 'heartbeat_at' => $now,
+            ]);
+            $this->audit->record($session, 'import.cancellation_requested', $actor, 'operator_requested', [
+                'attempt_id' => max(0, (int) $session->current_attempt),
+                'processed' => (int) $session->processed,
             ]);
 
             if ($session->status === ImportStatus::Cancelling
@@ -89,7 +97,7 @@ final class ImportExecutionLifecycle
                 return false;
             }
 
-            if (! in_array($session->status, [ImportStatus::Queued, ImportStatus::Importing], true)) {
+            if (! in_array($session->status, [ImportStatus::Queued, ImportStatus::Importing, ImportStatus::Failed], true)) {
                 return false;
             }
 
@@ -135,7 +143,7 @@ final class ImportExecutionLifecycle
                 return true;
             }
 
-            if (! in_array($session->status, [ImportStatus::Queued, ImportStatus::Importing], true)) {
+            if (! in_array($session->status, [ImportStatus::Queued, ImportStatus::Importing, ImportStatus::Failed], true)) {
                 return false;
             }
 
@@ -145,6 +153,10 @@ final class ImportExecutionLifecycle
 
             if ($session->processed > $session->execution_total) {
                 throw new DomainException('The execution counter exceeded its confirmed row total.');
+            }
+
+            if ($session->status === ImportStatus::Failed) {
+                $this->outbox->supersedeDeferred($session);
             }
 
             $session->transitionTo(ImportStatus::Completed);
@@ -185,7 +197,7 @@ final class ImportExecutionLifecycle
             ]);
             $this->recordAttemptOutcome($session);
             $session->save();
-            $this->dispatchTerminalCallbacksAfterCommit($session);
+            $this->dispatchTerminalCallbacksAfterCommit($session, $terminalStatus === ImportStatus::Failed);
         }, 3);
     }
 
@@ -222,9 +234,15 @@ final class ImportExecutionLifecycle
             ]);
             $this->recordAttemptOutcome($session);
             $session->save();
+            $this->audit->record($session, 'import.recovery_failed', reasonCode: 'recovery_invariant_or_limit', metadata: [
+                'attempt_id' => max(0, (int) $session->current_attempt),
+                'recovery_count' => (int) $session->recovery_count,
+            ]);
 
             if (! $wasAlreadyFailed) {
                 $this->dispatchTerminalCallbacksAfterCommit($session);
+            } else {
+                $this->outbox->recordTerminal($session);
             }
         }, 3);
     }
@@ -267,7 +285,7 @@ final class ImportExecutionLifecycle
             ]);
             $this->recordAttemptOutcome($session);
             $session->save();
-            $this->dispatchTerminalCallbacksAfterCommit($session);
+            $this->dispatchTerminalCallbacksAfterCommit($session, $terminalStatus === ImportStatus::Failed);
         }, 3);
     }
 
@@ -333,8 +351,28 @@ final class ImportExecutionLifecycle
         $session->forceFill(['attempt_history' => $history]);
     }
 
-    private function dispatchTerminalCallbacksAfterCommit(ImportSession $session): void
+    private function dispatchTerminalCallbacksAfterCommit(ImportSession $session, bool $deferNotification = false): void
     {
+        $this->outbox->recordTerminal($session, $deferNotification);
+        $event = match ($session->status) {
+            ImportStatus::Completed => 'import.completed',
+            ImportStatus::Failed => 'import.failed',
+            ImportStatus::Cancelled => 'import.cancelled',
+            default => null,
+        };
+
+        if ($event !== null) {
+            $this->audit->record($session, $event, reasonCode: 'terminal_transition', metadata: [
+                'status' => $session->status->value,
+                'attempt_id' => max(0, (int) $session->current_attempt),
+                'processed' => (int) $session->processed,
+                'created' => (int) $session->created_count,
+                'updated' => (int) $session->updated_count,
+                'skipped' => (int) $session->skipped_count,
+                'failed' => (int) $session->failed_count,
+            ]);
+        }
+
         $sessionId = (string) $session->getKey();
         $attemptId = $session->current_attempt;
         $status = $session->status;
@@ -350,25 +388,37 @@ final class ImportExecutionLifecycle
         );
 
         $session->getConnection()->afterCommit(function () use ($sessionId, $snapshot): void {
-            try {
-                $fresh = ImportSession::query()->find($sessionId);
+            $fresh = ImportSession::query()->find($sessionId);
 
-                if ($fresh !== null) {
-                    $definition = $this->importers->get((string) $fresh->importer_key);
-                    $this->hooks->afterImport($definition, $fresh);
-                }
-            } catch (Throwable $exception) {
-                Log::error('Smart Import after-import hook failed after terminal state was committed.', [
-                    'import_id' => $sessionId,
-                    'attempt' => $snapshot->attemptId,
-                    'exception' => $exception::class,
-                ]);
+            if ($fresh === null) {
+                return;
             }
 
             try {
-                event($snapshot);
+                $this->executionContext->run($fresh, function () use ($fresh, $snapshot, $sessionId): void {
+                    try {
+                        $definition = $this->importers->get((string) $fresh->importer_key);
+                        $this->hooks->afterImport($definition, $fresh);
+                    } catch (Throwable $exception) {
+                        Log::error('Smart Import after-import hook failed after terminal state was committed.', [
+                            'import_id' => $sessionId,
+                            'attempt' => $snapshot->attemptId,
+                            'exception' => $exception::class,
+                        ]);
+                    }
+
+                    try {
+                        event($snapshot);
+                    } catch (Throwable $exception) {
+                        Log::error('Smart Import terminal event listener failed after state was committed.', [
+                            'import_id' => $sessionId,
+                            'attempt' => $snapshot->attemptId,
+                            'exception' => $exception::class,
+                        ]);
+                    }
+                });
             } catch (Throwable $exception) {
-                Log::error('Smart Import terminal event listener failed after state was committed.', [
+                Log::error('Smart Import terminal callbacks could not establish the import execution context.', [
                     'import_id' => $sessionId,
                     'attempt' => $snapshot->attemptId,
                     'exception' => $exception::class,

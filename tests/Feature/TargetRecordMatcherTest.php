@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Services\TargetRecordMatcher;
+use SmartImport\Services\StagedRowService;
 use SmartImport\Tests\Fixtures\CompositeStagingImportDefinition;
 use SmartImport\Tests\Fixtures\ImportTargetModel;
 use SmartImport\Tests\Fixtures\StagingImportDefinition;
@@ -77,6 +78,26 @@ class TargetRecordMatcherTest extends TestCase
         $this->assertSame('matched', $matches[0]['change_type']);
         $this->assertSame((string) $existing->getKey(), $matches[0]['target_id']);
         $this->assertSame('new', $matches[1]['change_type']);
+    }
+
+    #[Test]
+    public function key_hashes_use_the_same_scalar_equivalence_as_target_matching(): void
+    {
+        $definition = new StagingImportDefinition();
+        $matcher = app(TargetRecordMatcher::class);
+        $target = $this->target(['name' => 'One', 'email' => '1']);
+        $rows = $matcher->matchBatch($definition, [
+            ['name' => 'Integer key', 'email' => 1],
+            ['name' => 'String key', 'email' => '1'],
+        ]);
+
+        $intHash = app(StagedRowService::class)->matchKeyHash($definition, ['name' => 'Integer key', 'email' => 1]);
+        $stringHash = app(StagedRowService::class)->matchKeyHash($definition, ['name' => 'String key', 'email' => '1']);
+
+        $this->assertSame('matched', $rows[0]['change_type']);
+        $this->assertSame((string) $target->getKey(), $rows[0]['target_id']);
+        $this->assertSame($rows[0]['target_id'], $rows[1]['target_id']);
+        $this->assertSame($intHash, $stringHash);
     }
 
     #[Test]

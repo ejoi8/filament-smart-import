@@ -13,6 +13,7 @@ use RuntimeException;
 use SmartImport\Data\ImportField;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Models\ImportRow;
+use SmartImport\Models\ImportOutboxEvent;
 use SmartImport\Models\ImportSession;
 use Throwable;
 
@@ -22,6 +23,7 @@ final class ImportExportService
         private ImportAuthorization $authorization,
         private ImportCoordinator $coordinator,
         private ImporterRegistry $importers,
+        private ImportPayloadCodec $payloadCodec,
     ) {}
 
     /** Stream a canonical-header CSV template for one authorized importer. */
@@ -134,6 +136,13 @@ final class ImportExportService
         $duration = $session->started_at === null
             ? null
             : max(0, ($session->finished_at ?? now())->getTimestamp() - $session->started_at->getTimestamp());
+        $outboxStatus = ImportOutboxEvent::query()
+            ->where('import_id', $session->getKey())
+            ->orderByDesc('id')
+            ->value('delivery_status');
+        $unchanged = $session->rows()->where('execution_status', 'skipped')->where('last_error_code', 'unchanged')->count();
+        $excluded = $session->rows()->where('execution_status', 'excluded')->count();
+        $snapshotConflicts = $session->rows()->where('execution_status', 'failed')->where('last_error_code', 'target_changed_after_preview')->count();
         $summary = [
             ['import_id', (string) $session->getKey()],
             ['filename', $session->original_filename],
@@ -157,8 +166,13 @@ final class ImportExportService
             ['updated', (int) $session->updated_count],
             ['skipped', (int) $session->skipped_count],
             ['failed', (int) $session->failed_count],
+            ['unchanged', $unchanged],
+            ['excluded', $excluded],
+            ['snapshot_conflicts', $snapshotConflicts],
             ['not_processed', max(0, (int) $session->execution_total - (int) $session->processed)],
             ['cancelled', $session->status === ImportStatus::Cancelled ? 1 : 0],
+            ['attempts', count($session->attempt_history ?? [])],
+            ['notification_delivery_status', is_string($outboxStatus) ? $outboxStatus : 'none'],
         ];
 
         return $this->csvLines([['metric', 'value'], ...$summary]);
@@ -226,7 +240,10 @@ final class ImportExportService
                     }
 
                     $field = is_string($error['field'] ?? null) ? $error['field'] : '';
-                    $mappedValues = $row->mapped_values ?? [];
+                    $mappedValues = $this->payloadCodec->reveal(
+                        $row->mapped_values,
+                        array_keys(array_filter($fieldAccess)),
+                    );
                     $value = $field !== ''
                         && ($fieldAccess[$field] ?? false)
                         && array_key_exists($field, $mappedValues)

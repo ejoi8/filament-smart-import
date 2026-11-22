@@ -12,6 +12,7 @@ use SmartImport\Enums\ImportStatus;
 use SmartImport\Services\ImportAuthorization;
 use SmartImport\Services\ImportCoordinator;
 use SmartImport\Services\ImportExportService;
+use SmartImport\Models\ImportOutboxEvent;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 final class ImportHistoryDetailPage extends ImportHubPage
@@ -51,12 +52,17 @@ final class ImportHistoryDetailPage extends ImportHubPage
                     'retry',
                     'retry_of_attempt',
                     'queued_at',
+                    'excluded_invalid_count',
                 ];
 
                 return array_intersect_key($attempt, array_flip($allowed));
             })
             ->values()
             ->all();
+        $deliveryStatus = ImportOutboxEvent::query()
+            ->where('import_id', $record->getKey())
+            ->orderByDesc('id')
+            ->value('delivery_status');
 
         $this->history = [
             'id' => (string) $record->getKey(),
@@ -91,7 +97,11 @@ final class ImportHistoryDetailPage extends ImportHubPage
                 'updated' => (int) $record->updated_count,
                 'skipped' => (int) $record->skipped_count,
                 'failed' => (int) $record->failed_count,
+                'unchanged' => $record->rows()->where('execution_status', 'skipped')->where('last_error_code', 'unchanged')->count(),
+                'excluded' => $record->rows()->where('execution_status', 'excluded')->count(),
+                'snapshot_conflicts' => $record->rows()->where('execution_status', 'failed')->where('last_error_code', 'target_changed_after_preview')->count(),
             ],
+            'notification_delivery_status' => is_string($deliveryStatus) ? $deliveryStatus : 'none',
             'attempt' => (int) $record->current_attempt,
             'attempts' => $attempts,
             'received_at' => $record->created_at?->toIso8601String(),
@@ -100,6 +110,16 @@ final class ImportHistoryDetailPage extends ImportHubPage
             'duration_seconds' => $startedAt === null
                 ? null
                 : max(0, ($finishedAt ?? now())->getTimestamp() - $startedAt->getTimestamp()),
+            'audit' => app(\SmartImport\Services\ImportAuditService::class)->latestFor((string) $record->getKey(), $this->actor(), 50)
+                ->map(static fn (\SmartImport\Models\ImportAuditEntry $entry): array => [
+                    'event' => $entry->event,
+                    'reason_code' => $entry->reason_code,
+                    'actor_type' => $entry->actor_type,
+                    'actor_id' => $entry->actor_id,
+                    'metadata' => $entry->metadata ?? [],
+                    'occurred_at' => $entry->created_at?->toIso8601String(),
+                ])
+                ->all(),
         ];
     }
 

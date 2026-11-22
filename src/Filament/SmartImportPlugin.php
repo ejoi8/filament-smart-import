@@ -12,6 +12,7 @@ use SmartImport\Filament\Pages\ImportHistoryRowDetailPage;
 use SmartImport\Filament\Pages\ImportHistoryRowsPage;
 use SmartImport\Filament\Pages\ImportMappingPage;
 use SmartImport\Filament\Pages\ImportProgressPage;
+use SmartImport\Filament\Pages\ImportReviewPage;
 use SmartImport\Services\HubPanelRegistry;
 
 final class SmartImportPlugin implements Plugin
@@ -37,6 +38,7 @@ final class SmartImportPlugin implements Plugin
             ActiveImportsPage::class,
             ImportHistoryPage::class,
             ImportMappingPage::class,
+            ImportReviewPage::class,
             ImportProgressPage::class,
             ImportHistoryDetailPage::class,
             ImportHistoryRowsPage::class,

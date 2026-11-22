@@ -32,6 +32,7 @@ final class ImportCoordinator
     public function __construct(
         private ImportAuthorization $authorization,
         private ImporterRegistry $importers,
+        private ImportAuditService $audit,
     ) {}
 
     /**
@@ -116,7 +117,7 @@ final class ImportCoordinator
             $data['importer_version'] = $definition->version();
         }
 
-        return DB::transaction(function () use ($data, $identity, $rejectionReason): ImportSession {
+        return DB::transaction(function () use ($data, $identity, $actor, $rejectionReason): ImportSession {
             $session = new ImportSession();
             $session->forceFill(array_merge($data, [
                 'created_by_type' => $identity->type,
@@ -131,6 +132,14 @@ final class ImportCoordinator
                 $session->error_summary = $rejectionReason;
                 $session->save();
             }
+
+            $this->audit->record(
+                $session,
+                $rejectionReason === null ? 'intake.registered' : 'intake.rejected',
+                $actor,
+                $rejectionReason === null ? 'source_registered' : 'unsafe_source',
+                ['source' => $session->source, 'file_type' => $session->file_type],
+            );
 
             return $session;
         });
@@ -193,6 +202,23 @@ final class ImportCoordinator
             $session->forceFill($metadata);
             $session->save();
 
+            $event = match ($next) {
+                IntakeStatus::Rejected => 'intake.rejected',
+                IntakeStatus::Archived => 'intake.archived',
+                IntakeStatus::Claimed => 'intake.claimed',
+                IntakeStatus::Ready, IntakeStatus::Discovered => null,
+            };
+
+            if ($event !== null) {
+                $this->audit->record(
+                    $session,
+                    $event,
+                    $actor,
+                    $next === IntakeStatus::Rejected ? 'operator_rejected' : 'operator_action',
+                    $event === 'intake.rejected' ? ['source' => $session->source] : [],
+                );
+            }
+
             return $session;
         }, 3);
     }
@@ -247,6 +273,9 @@ final class ImportCoordinator
             }
 
             $session->save();
+            $this->audit->record($session, 'importer.assigned', $actor, 'operator_assigned', [
+                'importer_key' => $definition->key(),
+            ]);
 
             return $session;
         });
@@ -266,6 +295,7 @@ final class ImportCoordinator
         array $mapping,
         int $estimatedTotal,
         Authenticatable $actor,
+        array $options = [],
     ): ImportSession {
         if ($sheetIndex < 0 || $sheetIndex > 65535) {
             throw new InvalidArgumentException('The selected worksheet index must be between 0 and 65535.');
@@ -281,6 +311,15 @@ final class ImportCoordinator
 
         if ($estimatedTotal < 0) {
             throw new InvalidArgumentException('The estimated staging row count cannot be negative.');
+        }
+
+        if (array_diff(array_keys($options), ['reader', 'importer', 'security']) !== []
+            || ! is_array($options['reader'] ?? null)
+            || ! is_array($options['importer'] ?? null)
+            || ! is_array($options['security'] ?? null)
+            || array_diff(array_keys($options['security']), ['index_hash_version']) !== []
+            || ! in_array($options['security']['index_hash_version'] ?? null, [1, 2], true)) {
+            throw new InvalidArgumentException('Import configuration options must use the validated reader/importer structure.');
         }
 
         $definition = $this->importers->get($importerKey);
@@ -331,6 +370,7 @@ final class ImportCoordinator
             $mapping,
             $estimatedTotal,
             $actor,
+            $options,
         ): ImportSession {
             $session = $this->authorization
                 ->applyActorScope(ImportSession::query()->lockForUpdate(), $actor)
@@ -353,12 +393,19 @@ final class ImportCoordinator
 
             $currentMapping = $session->mapping ?? [];
             ksort($currentMapping, SORT_NUMERIC);
+            $currentOptions = $session->options ?? [];
+            $currentImportOptions = [
+                'reader' => $currentOptions['reader'] ?? [],
+                'importer' => $currentOptions['importer'] ?? [],
+                'security' => $currentOptions['security'] ?? ['index_hash_version' => 1],
+            ];
             $mappingChanged = $session->importer_key !== $importerKey
                 || $session->importer_version !== $definition->version()
                 || $session->sheet_index !== $sheetIndex
                 || $session->sheet_name !== $sheetName
                 || $session->sheet_header_row !== $headerRow
-                || $currentMapping !== $mapping;
+                || $currentMapping !== $mapping
+                || $currentImportOptions !== $options;
 
             $session->rows()->delete();
             $session->forceFill([
@@ -369,6 +416,7 @@ final class ImportCoordinator
                 'sheet_name' => $sheetName,
                 'sheet_header_row' => $headerRow,
                 'mapping' => $mapping,
+                'options' => $options,
                 'mapping_revision' => $session->mapping_revision + ($mappingChanged ? 1 : 0),
                 'staging_revision' => $session->staging_revision + 1,
                 'stage_total' => $estimatedTotal,
@@ -387,6 +435,16 @@ final class ImportCoordinator
 
             $session->transitionTo(ImportStatus::Staging);
             $session->save();
+            $this->audit->record($session, 'configuration.saved', $actor, 'review_configuration_saved', array_filter([
+                'importer_key' => $definition->key(),
+                'mapping_revision' => $session->mapping_revision,
+                'staging_revision' => $session->staging_revision,
+                'sheet_index' => $sheetIndex,
+                'header_row' => $headerRow,
+                'source_column_count' => count($mapping),
+                'mapped_field_count' => count(array_filter($mapping, static fn (?string $field): bool => $field !== null)),
+                'settings_changed' => $mappingChanged,
+            ], static fn (mixed $value): bool => $value !== null));
 
             return $session;
         });

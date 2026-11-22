@@ -8,6 +8,7 @@ final readonly class ImportRowContext
 {
     /**
      * @param array<string, mixed> $values Confirmed normalized values from the field allowlist.
+     * @param array<string, string> $importerOptions Validated choices declared by the importer.
      */
     public function __construct(
         public string $sessionId,
@@ -21,6 +22,7 @@ final readonly class ImportRowContext
         public ?string $targetId,
         public array $values,
         public int $attemptId = 1,
+        public array $importerOptions = [],
     ) {}
 
     public function idempotencyKey(): string

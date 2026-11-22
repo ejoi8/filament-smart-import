@@ -8,6 +8,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use SmartImport\Exceptions\ImportCancellationRequested;
 use SmartImport\Contracts\ImportDefinition;
+use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Data\ImportRowContext;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Enums\ImportWriteAction;
@@ -22,6 +23,9 @@ final class ImportExecutionService
         private RowDataProcessor $rowDataProcessor,
         private StagedRowService $stagedRows,
         private TargetRecordMatcher $targetRecordMatcher,
+        private ImportValueComparator $valueComparator,
+        private ImportExecutionContext $executionContext,
+        private ImportPayloadCodec $payloadCodec,
     ) {}
 
     /**
@@ -31,6 +35,15 @@ final class ImportExecutionService
      * @return array{execution_status: string, target_type: string|null, target_id: string|null, already_processed: bool}
      */
     public function processRow(string $sessionId, int $rowId, int $confirmedRevision, ?int $attemptId = null): array
+    {
+        $session = ImportSession::query()->findOrFail($sessionId);
+        return $this->executionContext->run(
+            $session,
+            fn (): array => $this->processRowWithinContext($sessionId, $rowId, $confirmedRevision, $attemptId),
+        );
+    }
+
+    private function processRowWithinContext(string $sessionId, int $rowId, int $confirmedRevision, ?int $attemptId): array
     {
         $session = ImportSession::query()->findOrFail($sessionId);
         $definition = $this->definition($session);
@@ -114,9 +127,16 @@ final class ImportExecutionService
                 return $this->result($row->fresh(), false);
             }
 
-            if ($processed['mapped_values'] !== ($row->mapped_values ?? [])
-                || $processed['normalized_values'] !== ($row->normalized_values ?? [])
-                || $this->stagedRows->matchKeyHash($definition, $processed['normalized_values']) !== $row->match_key_hash) {
+            $mappedValues = $this->payloadCodec->reveal($row->mapped_values);
+            $normalizedValues = $this->payloadCodec->reveal($row->normalized_values);
+
+            if ($processed['mapped_values'] !== $mappedValues
+                || $processed['normalized_values'] !== $normalizedValues
+                || $this->stagedRows->matchKeyHash(
+                    $definition,
+                    $processed['normalized_values'],
+                    (int) ($session->options['security']['index_hash_version'] ?? 1),
+                ) !== $row->match_key_hash) {
                 $this->finishRow($row, $session, $connectionName, ImportWriteAction::Fail, 'staged_values_changed');
 
                 return $this->result($row->fresh(), false);
@@ -137,6 +157,52 @@ final class ImportExecutionService
             }
 
             $decision = $definition->writePolicy()->decisionFor($matches['change_type']);
+            $unchangedPreview = $preview['action'] === ImportWriteAction::Skip->value
+                && ($preview['reason'] ?? null) === 'unchanged';
+
+            if ($decision['action'] === ImportWriteAction::Update
+                && ($preview['action'] === ImportWriteAction::Update->value || $unchangedPreview)) {
+                if ((string) ($matches['target_id'] ?? '') !== (string) ($preview['target_id'] ?? '')) {
+                    $this->finishRow($row, $session, $connectionName, ImportWriteAction::Fail, 'target_changed_after_preview');
+
+                    return $this->result($row->fresh(), false);
+                }
+
+                $currentTarget = $this->lockTarget($definition, (string) $matches['target_id']);
+                $snapshot = $preview['target_snapshot'] ?? [];
+
+                if (! $currentTarget instanceof Model
+                    || ! $this->targetRecordMatcher->matchesKey($definition, $processed['normalized_values'], $currentTarget)
+                    || ! $this->valueComparator->matchesTargetSnapshot(
+                        $currentTarget,
+                        is_array($snapshot) ? $snapshot : [],
+                        array_keys($processed['normalized_values']),
+                    )) {
+                    $this->finishRow($row, $session, $connectionName, ImportWriteAction::Fail, 'target_changed_after_preview');
+
+                    return $this->result($row->fresh(), false);
+                }
+
+                if ($unchangedPreview) {
+                    if ($this->valueComparator->targetHasChanges($currentTarget, $processed['normalized_values'], $definition)) {
+                        $this->finishRow($row, $session, $connectionName, ImportWriteAction::Fail, 'target_changed_after_preview');
+
+                        return $this->result($row->fresh(), false);
+                    }
+
+                    $this->finishRow(
+                        $row,
+                        $session,
+                        $connectionName,
+                        ImportWriteAction::Skip,
+                        'unchanged',
+                        $matches['target_type'],
+                        $matches['target_id'],
+                    );
+
+                    return $this->result($row->fresh(), false);
+                }
+            }
 
             if ($decision['action']->value !== $preview['action']
                 || ($decision['action'] === ImportWriteAction::Update
@@ -244,6 +310,14 @@ final class ImportExecutionService
         return new $model();
     }
 
+    private function lockTarget(ImportDefinition $definition, string $targetId): ?Model
+    {
+        $modelClass = $definition->targetModel();
+        $model = new $modelClass();
+
+        return $model->newQuery()->whereKey($targetId)->lockForUpdate()->first();
+    }
+
     /** @return array{mapped_values: array<string, mixed>, normalized_values: array<string, mixed>, errors: array<int, array<string, mixed>>, valid: bool} */
     private function revalidate(ImportDefinition $definition, ImportSession $session, ImportRow $row): array
     {
@@ -255,9 +329,11 @@ final class ImportExecutionService
 
         $sourceValues = [];
 
+        $mappedValues = $this->payloadCodec->reveal($row->mapped_values);
+
         foreach ($mapping as $sourceColumn => $fieldName) {
-            if ($fieldName !== null && array_key_exists($fieldName, $row->mapped_values ?? [])) {
-                $sourceValues[$sourceColumn] = $row->mapped_values[$fieldName];
+            if ($fieldName !== null && array_key_exists($fieldName, $mappedValues)) {
+                $sourceValues[$sourceColumn] = $mappedValues[$fieldName];
             }
         }
 
@@ -294,6 +370,7 @@ final class ImportExecutionService
             $targetId,
             $values,
             (int) $session->current_attempt,
+            is_array($session->options['importer'] ?? null) ? $session->options['importer'] : [],
         );
     }
 

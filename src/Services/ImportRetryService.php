@@ -11,10 +11,13 @@ use SmartImport\Models\ImportSession;
 
 final class ImportRetryService
 {
+    private const RETRY_BATCH_SIZE = 250;
+
     public function __construct(
         private ImportAuthorization $authorization,
         private ImporterRegistry $importers,
         private ImportExecutionDispatcher $dispatcher,
+        private ImportAuditService $audit,
     ) {}
 
     /** Start a new attempt containing only failed rows from a fully completed attempt. */
@@ -53,12 +56,9 @@ final class ImportRetryService
             $this->authorization->authorize('useImporter', $actor, $definition);
             $this->dispatcher->assertQueueCanRunAsynchronously();
 
-            $rows = $session->rows()
-                ->where('execution_status', 'failed')
-                ->orderBy('id')
-                ->lockForUpdate()
-                ->get();
-            $retryTotal = $rows->count();
+            $failedRows = $session->rows()
+                ->where('execution_status', 'failed');
+            $retryTotal = (clone $failedRows)->count();
 
             if ($retryTotal < 1 || $retryTotal !== $session->failed_count) {
                 throw new DomainException('The failed row count does not match the completed attempt; retry was not started.');
@@ -80,14 +80,32 @@ final class ImportRetryService
                 'queued_at' => $queuedAt->toISOString(),
             ];
 
-            foreach ($rows as $row) {
-                $row->forceFill([
-                    'execution_status' => 'pending',
-                    'last_error_code' => null,
-                    'last_error_message' => null,
-                    'completed_at' => null,
-                ]);
-                $row->save();
+            $resetCount = 0;
+            $failedRows
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->chunkById(self::RETRY_BATCH_SIZE, function ($rows) use ($session, &$resetCount): void {
+                    $rowIds = $rows->modelKeys();
+                    $updated = $session->rows()
+                        ->whereIn('id', $rowIds)
+                        ->where('execution_status', 'failed')
+                        ->update([
+                            'execution_status' => 'pending',
+                            'last_error_code' => null,
+                            'last_error_message' => null,
+                            'completed_at' => null,
+                            'updated_at' => now(),
+                        ]);
+
+                    if ($updated !== count($rowIds)) {
+                        throw new DomainException('The failed row set changed while a retry was being prepared. No retry was started.');
+                    }
+
+                    $resetCount += $updated;
+                });
+
+            if ($resetCount !== $retryTotal) {
+                throw new DomainException('The failed row set changed while a retry was being prepared. No retry was started.');
             }
 
             $session->forceFill([
@@ -109,6 +127,11 @@ final class ImportRetryService
             ]);
             $session->transitionTo(ImportStatus::Queued);
             $session->save();
+            $this->audit->record($session, 'import.retry_started', $actor, 'failed_rows_retry', [
+                'attempt_id' => $attemptId,
+                'retry_of_attempt' => $attemptId - 1,
+                'execution_total' => $retryTotal,
+            ]);
 
             $session->getConnection()->afterCommit(fn () => $this->dispatcher->dispatchConfirmed(
                 (string) $session->getKey(),

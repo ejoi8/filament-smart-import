@@ -5,23 +5,39 @@ namespace SmartImport;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
 use SmartImport\Console\Commands\DiscoverFilesCommand;
+use SmartImport\Console\Commands\DeliverImportOutboxCommand;
+use SmartImport\Console\Commands\RetentionDryRunCommand;
+use SmartImport\Console\Commands\ConfirmImportCommand;
+use SmartImport\Console\Commands\PreviewImportCommand;
 use SmartImport\Console\Commands\RecoverImportsCommand;
+use SmartImport\Console\Commands\StageImportCommand;
 use SmartImport\Contracts\ImportDefinition;
+use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Contracts\ImportPresetScope;
 use SmartImport\Contracts\ImportSessionScope;
+use SmartImport\Contracts\ImportNotificationRecipientResolver;
 use SmartImport\Services\ActorOwnedImportPresetScope;
 use SmartImport\Services\ActorOwnedImportSessionScope;
 use SmartImport\Services\ColumnMapper;
 use SmartImport\Services\FileIntakeService;
 use SmartImport\Services\HubPanelRegistry;
 use SmartImport\Services\ImportAuthorization;
+use SmartImport\Services\ImportAuditService;
+use SmartImport\Services\ImportNotificationService;
+use SmartImport\Services\ImportOutboxDispatcher;
+use SmartImport\Services\ImportOutboxDeliveryService;
+use SmartImport\Services\ImportOutboxService;
+use SmartImport\Services\InitiatingActorNotificationRecipientResolver;
 use SmartImport\Services\ImportCoordinator;
+use SmartImport\Services\ImportPayloadCodec;
+use SmartImport\Services\ImportIndexHasher;
 use SmartImport\Services\ImportExportService;
 use SmartImport\Services\ImportExecutionService;
 use SmartImport\Services\ImportExecutionDispatcher;
 use SmartImport\Services\ImportExecutionLifecycle;
 use SmartImport\Services\ImportProgressService;
 use SmartImport\Services\ImportRetryService;
+use SmartImport\Services\ImportRetentionService;
 use SmartImport\Services\ImportRecoveryService;
 use SmartImport\Services\ImportHookDispatcher;
 use SmartImport\Services\ImportStagingService;
@@ -30,6 +46,7 @@ use SmartImport\Services\MappingPresetService;
 use SmartImport\Services\RowDataProcessor;
 use SmartImport\Services\SpreadsheetReader;
 use SmartImport\Services\StagedRowService;
+use SmartImport\Services\NoTenantImportExecutionContext;
 
 class SmartImportServiceProvider extends ServiceProvider
 {
@@ -89,6 +106,34 @@ class SmartImportServiceProvider extends ServiceProvider
             return $app->make($class);
         });
 
+        $this->app->singleton(ImportExecutionContext::class, function ($app): ImportExecutionContext {
+            $class = config('smart-import.execution.context', NoTenantImportExecutionContext::class);
+
+            if (! is_string($class) || ! is_a($class, ImportExecutionContext::class, true)) {
+                throw new InvalidArgumentException(sprintf(
+                    'Configured import execution context [%s] must implement [%s].',
+                    is_string($class) ? $class : get_debug_type($class),
+                    ImportExecutionContext::class,
+                ));
+            }
+
+            return $app->make($class);
+        });
+
+        $this->app->singleton(ImportNotificationRecipientResolver::class, function ($app): ImportNotificationRecipientResolver {
+            $class = config('smart-import.notifications.recipient_resolver', InitiatingActorNotificationRecipientResolver::class);
+
+            if (! is_string($class) || ! is_a($class, ImportNotificationRecipientResolver::class, true)) {
+                throw new InvalidArgumentException(sprintf(
+                    'Configured import notification recipient resolver [%s] must implement [%s].',
+                    is_string($class) ? $class : get_debug_type($class),
+                    ImportNotificationRecipientResolver::class,
+                ));
+            }
+
+            return $app->make($class);
+        });
+
         $this->app->singleton(HubPanelRegistry::class, function (): HubPanelRegistry {
             $panels = config('smart-import.filament.panels', []);
 
@@ -100,6 +145,14 @@ class SmartImportServiceProvider extends ServiceProvider
         });
 
         $this->app->singleton(ImportAuthorization::class);
+        $this->app->singleton(ImportAuditService::class);
+        $this->app->singleton(ImportRetentionService::class);
+        $this->app->singleton(ImportNotificationService::class);
+        $this->app->singleton(ImportOutboxDispatcher::class);
+        $this->app->singleton(ImportOutboxDeliveryService::class);
+        $this->app->singleton(ImportOutboxService::class);
+        $this->app->singleton(ImportPayloadCodec::class);
+        $this->app->singleton(ImportIndexHasher::class);
         $this->app->singleton(ImportHookDispatcher::class);
         $this->app->singleton(ImportCoordinator::class);
         $this->app->singleton(ImportExportService::class);
@@ -124,7 +177,15 @@ class SmartImportServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
         if ($this->app->runningInConsole()) {
-            $this->commands([DiscoverFilesCommand::class, RecoverImportsCommand::class]);
+            $this->commands([
+                DiscoverFilesCommand::class,
+                RecoverImportsCommand::class,
+                StageImportCommand::class,
+                PreviewImportCommand::class,
+                ConfirmImportCommand::class,
+                DeliverImportOutboxCommand::class,
+                RetentionDryRunCommand::class,
+            ]);
 
             $this->publishes([
                 __DIR__.'/../config/smart-import.php' => config_path('smart-import.php'),

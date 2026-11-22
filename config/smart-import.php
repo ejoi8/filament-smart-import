@@ -24,6 +24,13 @@ return [
         'max_uncompressed_bytes' => 32 * 1024 * 1024,
         'preview_rows' => 20,
         'max_preview_rows' => 100,
+        'csv_delimiters' => [
+            ',' => 'Comma (,)',
+            ';' => 'Semicolon (;)',
+            '|' => 'Pipe (|)',
+            'tab' => 'Tab',
+        ],
+        'csv_encodings' => ['UTF-8', 'Windows-1252', 'ISO-8859-1', 'UTF-16LE'],
     ],
 
     'queue' => [
@@ -35,6 +42,25 @@ return [
         'chunk_size' => 100,
         'job_tries' => 3,
         'job_backoff_seconds' => [10, 30, 60],
+        // Tenant-aware hosts should configure a class implementing ImportExecutionContext.
+        'context' => SmartImport\Services\NoTenantImportExecutionContext::class,
+    ],
+
+    'security' => [
+        // Set a stable random secret to decouple indexed signatures from APP_KEY rotation.
+        'index_key' => env('SMART_IMPORT_INDEX_KEY'),
+    ],
+
+    'notifications' => [
+        'recipient_resolver' => SmartImport\Services\InitiatingActorNotificationRecipientResolver::class,
+        'lease_seconds' => 300,
+        'max_attempts' => 8,
+        'backoff_seconds' => [30, 120, 300],
+    ],
+
+    'preview' => [
+        // Keep small reviews responsive while avoiding long browser requests for large imports.
+        'async_threshold_rows' => 1000,
     ],
 
     'recovery' => [

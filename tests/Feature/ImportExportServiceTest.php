@@ -17,6 +17,7 @@ use PhpOffice\PhpSpreadsheet\IOFactory;
 use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Jobs\StageImportJob;
 use SmartImport\Models\ImportRow;
+use SmartImport\Models\ImportOutboxEvent;
 use SmartImport\Services\FileIntakeService;
 use SmartImport\Services\ImportExportService;
 use SmartImport\Services\ImportStagingService;
@@ -209,9 +210,35 @@ class ImportExportServiceTest extends TestCase
             'updated_count' => 0,
             'skipped_count' => 0,
             'failed_count' => 0,
+            'attempt_history' => [
+                ['attempt' => 1, 'status' => 'completed'],
+                ['attempt' => 2, 'status' => 'cancelled'],
+            ],
             'started_at' => now()->subMinute(),
             'finished_at' => now(),
         ])->save();
+        foreach ([
+            ['execution_status' => 'skipped', 'last_error_code' => 'unchanged'],
+            ['execution_status' => 'excluded', 'last_error_code' => null],
+            ['execution_status' => 'failed', 'last_error_code' => 'target_changed_after_preview'],
+        ] as $index => $outcome) {
+            ImportRow::forceCreate($outcome + [
+                'import_id' => $session->getKey(),
+                'source_row_number' => $index + 2,
+            ]);
+        }
+        ImportOutboxEvent::forceCreate([
+            'import_id' => $session->getKey(),
+            'attempt_id' => 2,
+            'terminal_status' => 'cancelled',
+            'event_key' => hash('sha256', 'summary-delivered-event'),
+            'payload_version' => 1,
+            'payload' => ['status' => 'cancelled'],
+            'delivery_status' => 'delivered',
+            'attempts' => 1,
+            'available_at' => now(),
+            'delivered_at' => now(),
+        ]);
 
         $csv = implode('', iterator_to_array($this->exports()->summaryCsv((string) $session->getKey(), $actor)));
         $rows = array_map('str_getcsv', array_filter(explode("\r\n", trim($csv))));
@@ -223,6 +250,11 @@ class ImportExportServiceTest extends TestCase
         $this->assertSame('1', $summary['created']);
         $this->assertSame('1', $summary['not_processed']);
         $this->assertSame('1', $summary['cancelled']);
+        $this->assertSame('1', $summary['unchanged']);
+        $this->assertSame('1', $summary['excluded']);
+        $this->assertSame('1', $summary['snapshot_conflicts']);
+        $this->assertSame('2', $summary['attempts']);
+        $this->assertSame('delivered', $summary['notification_delivery_status']);
         $this->assertStringNotContainsString("\r\n=1+1.csv", $csv);
     }
 

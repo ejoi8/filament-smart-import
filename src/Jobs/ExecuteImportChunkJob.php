@@ -8,6 +8,8 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use SmartImport\Exceptions\ImportCancellationRequested;
+use SmartImport\Contracts\ImportExecutionContext;
+use SmartImport\Models\ImportSession;
 use SmartImport\Services\ImportExecutionLifecycle;
 use SmartImport\Services\ImportExecutionService;
 use Throwable;
@@ -60,7 +62,22 @@ final class ExecuteImportChunkJob implements ShouldQueue
         $this->backoff = $backoff;
     }
 
-    public function handle(ImportExecutionService $execution, ImportExecutionLifecycle $lifecycle): void
+    public function handle(
+        ImportExecutionService $execution,
+        ImportExecutionLifecycle $lifecycle,
+        ?ImportExecutionContext $context = null,
+    ): void
+    {
+        $session = ImportSession::query()->find($this->sessionId);
+
+        if ($session === null) {
+            return;
+        }
+
+        ($context ?? app(ImportExecutionContext::class))->run($session, fn () => $this->runChunk($execution, $lifecycle));
+    }
+
+    private function runChunk(ImportExecutionService $execution, ImportExecutionLifecycle $lifecycle): void
     {
         if (! $lifecycle->beginChunk($this->sessionId, $this->attemptId, $this->confirmedRevision)) {
             return;

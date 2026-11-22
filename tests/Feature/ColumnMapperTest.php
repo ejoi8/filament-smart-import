@@ -38,6 +38,35 @@ class ColumnMapperTest extends TestCase
     }
 
     #[Test]
+    public function header_detection_skips_introductory_and_data_rows_and_returns_the_best_confident_match(): void
+    {
+        $result = $this->mapper()->detectHeaderRow(new ColumnMappingDefinition(), [
+            ['row_number' => 1, 'values' => [1 => 'Monthly contact report']],
+            ['row_number' => 2, 'values' => [1 => 'Name', 2 => 'E-mail']],
+            ['row_number' => 3, 'values' => [1 => 'Name', 2 => 'Email', 3 => 'National ID']],
+            ['row_number' => 4, 'values' => [1 => 'Ada Lovelace', 2 => 'ada@example.test', 3 => '0012']],
+        ]);
+
+        $this->assertSame([
+            'row_number' => 3,
+            'matched_fields' => ['name', 'email', 'no_kp'],
+            'required_fields_matched' => 1,
+            'exact_matches' => 2,
+        ], $result);
+    }
+
+    #[Test]
+    public function header_detection_fails_closed_when_required_fields_are_missing_or_colliding(): void
+    {
+        $result = $this->mapper()->detectHeaderRow(new ColumnMappingDefinition(), [
+            ['row_number' => 1, 'values' => [1 => 'Name', 2 => 'Name', 3 => 'Email']],
+            ['row_number' => 2, 'values' => [1 => 'Ada Lovelace', 2 => 'ada@example.test', 3 => '0012']],
+        ]);
+
+        $this->assertNull($result);
+    }
+
+    #[Test]
     public function normalization_handles_punctuation_case_and_unicode_when_available(): void
     {
         if (class_exists(\Normalizer::class)) {

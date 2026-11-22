@@ -6,10 +6,10 @@ A reusable Laravel import engine with an optional Filament 5 Import Hub. Import 
 
 ## Requirements
 
-- PHP 8.2 or newer.
+- PHP 8.2 or newer with Laravel 12; PHP 8.3 or newer with Laravel 13.
 - Laravel 12 or 13.
 - PhpSpreadsheet 5, installed as a package dependency.
-- Filament 5 is optional and required only for the Filament Hub.
+- Filament 5 is optional and required only for the Filament Hub and Resource action.
 - An asynchronous Laravel queue connection for background imports.
 
 ## Install for local development
@@ -175,21 +175,43 @@ php artisan smart-import:discover --actor=123 --guard=web
 
 The actor must resolve through the selected Laravel guard and pass the configured authorization. The package also provides `php artisan smart-import:recover --dry-run` to inspect stale work and `php artisan smart-import:recover` to recover eligible sessions. It does not install a host scheduler or start queue workers.
 
+The same staged review flow is available from Artisan with explicit actor and guard IDs: `smart-import:stage`, `smart-import:preview`, and `smart-import:confirm`. Preview never writes target records; confirmation requires the current reviewed revision and an explicit `--confirm` flag. See the [Artisan workflow](docs/cli.md).
+
+Completion and final-failure delivery uses a durable outbox. Run the configured queue worker and periodically schedule `php artisan smart-import:deliver-outbox`; see [terminal notifications](docs/notifications.md) for delivery guarantees and recipient setup.
+
+Audit history is available on authorized Import History details. Retention is inspection-only; review candidates with `php artisan smart-import:retention-dry-run`. See [audit history and retention inspection](docs/audit-retention.md).
+
 ## Security notes
 
 - Importers explicitly allowlist target fields; spreadsheet content cannot choose a model or database column.
 - Import files are stored privately, and the Hub does not expose server storage paths.
-- Sensitive before/after values are encrypted in preview storage and require the `viewSensitiveImportFields` Gate to reveal.
+- Fields declared sensitive are encrypted in new staged cell payloads; sensitive before/after values are encrypted in preview storage and require the `viewSensitiveImportFields` Gate to reveal. See [tenant context and data protection](docs/tenant-context.md) for tenant workers, legacy rows, keys, and storage limits.
 - History exports require the `export` Gate. Formula-like CSV values are neutralized, and sensitive cell values are withheld unless separately authorized.
 - Keep the package tables and imported target models on the same database connection so row writes and import counters can commit atomically.
 
 ## Development and known gaps
 
-The repository includes package tests for Laravel 12 and 13 and an isolated Laravel 12 application test suite with Filament 5.
+Run the package test suite after installing the development dependencies:
+
+```bash
+composer install
+composer test
+```
+
+The package tests use Orchestra Testbench and synthetic models/files. The separate Laravel + Filament applications used for panel integration checks are local fixtures and are not included in this Composer package. See the [compatibility record](docs/compatibility.md) for exact local versions, current CI coverage, and unverified minimum combinations.
+
+The repository has no `LICENSE` file and Composer's license metadata is unset. The owner must choose the license before public distribution. No stable version has been tagged.
 
 ## Documentation
 
 - [Filament Hub](docs/filament-hub.md)
+- [Artisan workflow](docs/cli.md)
 - [Importer definitions](docs/importer-definitions.md)
 - [SFTP inbox](docs/sftp-intake.md)
 - [Queue workers and recovery](docs/queue-workers.md)
+- [Terminal notifications](docs/notifications.md)
+- [Audit history and retention inspection](docs/audit-retention.md)
+- [Tenant context and data protection](docs/tenant-context.md)
+- [Performance measurements and processing limits](docs/performance.md)
+- [Compatibility and verification](docs/compatibility.md)
+- [Upgrade and deployment notes](docs/upgrading.md)

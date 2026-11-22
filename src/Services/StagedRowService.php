@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use SmartImport\Contracts\ImportDefinition;
+use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Data\ImportField;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Models\ImportRow;
@@ -25,6 +26,9 @@ final class StagedRowService
         private ImporterRegistry $importers,
         private RowDataProcessor $rowDataProcessor,
         private TargetRecordMatcher $targetRecordMatcher,
+        private ImportExecutionContext $executionContext,
+        private ImportPayloadCodec $payloadCodec,
+        private ImportAuditService $audit,
     ) {}
 
     /**
@@ -49,11 +53,18 @@ final class StagedRowService
     }
 
     /** Edit one mapped cell, re-run its field transforms/rules, and refresh affected file duplicate keys. */
-    public function edit(string $sessionId, int $rowId, string $fieldName, mixed $value, Authenticatable $actor): ImportRow
+    public function edit(
+        string $sessionId,
+        int $rowId,
+        string $fieldName,
+        mixed $value,
+        Authenticatable $actor,
+        int $expectedStagingRevision,
+    ): ImportRow
     {
         $this->assertEditableValue($value);
 
-        DB::transaction(function () use ($sessionId, $rowId, $fieldName, $value, $actor): void {
+        DB::transaction(function () use ($sessionId, $rowId, $fieldName, $value, $actor, $expectedStagingRevision): void {
             $session = $this->authorization
                 ->applyActorScope(ImportSession::query()->lockForUpdate(), $actor)
                 ->whereKey($sessionId)
@@ -66,17 +77,27 @@ final class StagedRowService
                 throw new \DomainException('Staged rows can be edited only while the import is ready for review.');
             }
 
+            if ($session->staging_revision !== $expectedStagingRevision) {
+                throw new \DomainException('This import changed after you opened the review. Refresh before editing.');
+            }
+
             if ($session->importer_key === null || $session->importer_version === null || $session->mapping === null) {
                 throw new \DomainException('The staged import configuration is incomplete.');
             }
 
             $definition = $this->importers->get($session->importer_key);
+            $this->authorization->authorize('useImporter', $actor, $definition);
 
             if ($definition->version() !== $session->importer_version) {
                 throw new \DomainException('The importer definition changed after these rows were staged.');
             }
 
             $field = $this->field($definition, $fieldName);
+
+            if ($field->sensitive) {
+                $this->authorization->authorize('editSensitiveImportFields', $actor, [$session, $field]);
+            }
+
             $mapping = $session->mapping;
 
             if (! in_array($fieldName, $mapping, true)) {
@@ -95,7 +116,7 @@ final class StagedRowService
 
             $previousStatus = $row->validation_status;
             $oldMatchKeyHash = $row->match_key_hash;
-            $mappedValues = $row->mapped_values ?? [];
+            $mappedValues = $this->payloadCodec->reveal($row->mapped_values);
             $mappedValues[$field->name] = $value;
             $sourceValues = [];
 
@@ -105,26 +126,30 @@ final class StagedRowService
                 }
             }
 
-            $result = $this->rowDataProcessor->process(
-                $definition,
-                $sourceValues,
-                $mapping,
-                $row->source_row_number,
-            );
-            $targetMatch = $this->targetRecordMatcher->matchBatch($definition, [$result['normalized_values']])[0];
+            [$result, $targetMatch] = $this->executionContext->run($session, function () use ($definition, $sourceValues, $mapping, $row): array {
+                $result = $this->rowDataProcessor->process(
+                    $definition,
+                    $sourceValues,
+                    $mapping,
+                    $row->source_row_number,
+                );
+
+                return [$result, $this->targetRecordMatcher->matchBatch($definition, [$result['normalized_values']])[0]];
+            });
             $errors = $result['errors'];
 
             foreach ($targetMatch['errors'] as $error) {
                 $errors[] = $error + ['source_row' => $row->source_row_number];
             }
 
-            $newMatchKeyHash = $this->matchKeyHash($definition, $result['normalized_values']);
+            $indexHashVersion = (int) ($session->options['security']['index_hash_version'] ?? 1);
+            $newMatchKeyHash = $this->matchKeyHash($definition, $result['normalized_values'], $indexHashVersion);
             $nextRevision = $session->staging_revision + 1;
             $newStatus = $errors === [] ? 'valid' : 'invalid';
 
             $row->forceFill([
-                'mapped_values' => $result['mapped_values'],
-                'normalized_values' => $result['normalized_values'],
+                'mapped_values' => $this->payloadCodec->protect($result['mapped_values'], $this->sensitiveFieldNames($definition)),
+                'normalized_values' => $this->payloadCodec->protect($result['normalized_values'], $this->sensitiveFieldNames($definition)),
                 'validation_errors' => $errors,
                 'validation_status' => $newStatus,
                 'match_key_hash' => $newMatchKeyHash,
@@ -140,8 +165,27 @@ final class StagedRowService
                 ->update(['preview' => null]);
 
             $session->forceFill(['staging_revision' => $nextRevision]);
+            $options = $session->options ?? [];
+            unset(
+                $options['preview_revision'],
+                $options['preview_mapping_revision'],
+                $options['preview_generation_id'],
+                $options['preview_recovery_count'],
+                $options['preview_processed'],
+                $options['preview_total'],
+                $options['preview_summary'],
+                $options['preview_error'],
+                $options['preview_heartbeat_at'],
+                $options['preview_state'],
+            );
+            $session->options = $options;
             $this->adjustValidationCounters($session, $previousStatus, $newStatus);
             $session->save();
+            $this->audit->record($session, 'row.corrected', $actor, 'operator_correction', [
+                'row_number' => $row->source_row_number,
+                'staging_revision' => $session->staging_revision,
+                'field_count' => 1,
+            ]);
 
             $matchHashes = array_values(array_unique(array_filter([$oldMatchKeyHash, $newMatchKeyHash], 'is_string')));
 
@@ -157,41 +201,9 @@ final class StagedRowService
     }
 
     /** Return a stable hash for the definition's complete, non-blank composite key. */
-    public function matchKeyHash(ImportDefinition $definition, array $normalizedValues): ?string
+    public function matchKeyHash(ImportDefinition $definition, array $normalizedValues, int $version = ImportIndexHasher::CURRENT_VERSION): ?string
     {
-        $fields = $definition->uniqueKeyFields();
-
-        if ($fields === []) {
-            return null;
-        }
-
-        $key = [];
-
-        foreach ($fields as $fieldName) {
-            if (! array_key_exists($fieldName, $normalizedValues)) {
-                return null;
-            }
-
-            $value = $normalizedValues[$fieldName];
-
-            if (
-                $value === null
-                || (is_string($value) && trim($value) === '')
-                || (! is_string($value) && ! is_int($value) && ! is_float($value) && ! is_bool($value))
-            ) {
-                return null;
-            }
-
-            $key[$fieldName] = $value;
-        }
-
-        try {
-            $encoded = json_encode($key, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
-        } catch (Throwable $exception) {
-            throw new InvalidArgumentException('The configured duplicate key could not be encoded safely.', 0, $exception);
-        }
-
-        return hash('sha256', $encoded);
+        return $this->targetRecordMatcher->keyHash($definition, $normalizedValues, $version);
     }
 
     /** Recheck all duplicate key groups for one current staging revision before review is unlocked. */
@@ -400,6 +412,20 @@ final class StagedRowService
         }
 
         throw new InvalidArgumentException(sprintf('Field [%s] is not defined by the selected importer.', $name));
+    }
+
+    /** @return list<string> */
+    private function sensitiveFieldNames(ImportDefinition $definition): array
+    {
+        $names = [];
+
+        foreach ($definition->fields() as $field) {
+            if ($field instanceof ImportField && $field->sensitive) {
+                $names[] = $field->name;
+            }
+        }
+
+        return $names;
     }
 
     private function isCurrent(?ImportSession $session, int $mappingRevision, int $stagingRevision, ImportStatus $status): bool

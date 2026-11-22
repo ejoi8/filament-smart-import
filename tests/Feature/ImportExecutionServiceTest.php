@@ -7,6 +7,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
@@ -16,6 +17,7 @@ use SmartImport\Enums\ImportStatus;
 use SmartImport\Events\ImportFinished;
 use SmartImport\Jobs\ExecuteImportChunkJob;
 use SmartImport\Jobs\StageImportJob;
+use SmartImport\Models\ImportAuditEntry;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
 use SmartImport\Services\FileIntakeService;
@@ -48,6 +50,8 @@ class ImportExecutionServiceTest extends TestCase
             $table->string('nickname')->nullable();
             $table->string('phone')->nullable();
             $table->string('note')->nullable();
+            $table->string('notes')->nullable();
+            $table->boolean('is_active')->default(false);
             $table->timestamps();
         });
 
@@ -145,12 +149,289 @@ class ImportExecutionServiceTest extends TestCase
     }
 
     #[Test]
+    public function changed_mapped_target_values_after_confirmation_fail_without_overwriting_them(): void
+    {
+        $target = $this->target([
+            'name' => 'Before review',
+            'email' => 'existing@example.test',
+            'api_token' => 'old-secret',
+            'department' => 'Sales',
+            'notes' => 'Operator note',
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm(
+            $actor,
+            "Name,Email,API token,Department\nImported name,existing@example.test,new-secret,Sales\n",
+        );
+        $row = $session->rows()->firstOrFail();
+        $target->forceFill(['department' => 'Changed by another user'])->save();
+
+        $result = $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
+
+        $this->assertSame('failed', $result['execution_status']);
+        $this->assertSame('target_changed_after_preview', $row->fresh()->last_error_code);
+        $this->assertSame('Before review', $target->fresh()->name);
+        $this->assertSame('old-secret', $target->fresh()->api_token);
+        $this->assertSame('Changed by another user', $target->fresh()->department);
+    }
+
+    #[Test]
+    public function changes_to_unmapped_target_fields_do_not_conflict_or_get_overwritten(): void
+    {
+        $target = $this->target([
+            'name' => 'Before review',
+            'email' => 'existing@example.test',
+            'api_token' => 'old-secret',
+            'department' => 'Sales',
+            'notes' => 'Original note',
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nImported name,existing@example.test,new-secret,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $target->forceFill(['notes' => 'Changed outside the import'])->save();
+
+        $result = $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
+
+        $this->assertSame('updated', $result['execution_status']);
+        $this->assertSame('Imported name', $target->fresh()->name);
+        $this->assertSame('Changed outside the import', $target->fresh()->notes);
+    }
+
+    #[Test]
+    public function missing_legacy_target_snapshot_fails_closed_without_writing(): void
+    {
+        $target = $this->target([
+            'name' => 'Before review',
+            'email' => 'existing@example.test',
+            'api_token' => 'old-secret',
+            'department' => 'Sales',
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nImported name,existing@example.test,new-secret,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $preview = $row->preview;
+        unset($preview['target_snapshot']);
+        DB::table('smart_import_rows')->where('id', $row->getKey())->update([
+            'preview' => json_encode($preview, JSON_THROW_ON_ERROR),
+        ]);
+
+        $result = $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
+
+        $this->assertSame('failed', $result['execution_status']);
+        $this->assertSame('target_changed_after_preview', $row->fresh()->last_error_code);
+        $this->assertSame('Before review', $target->fresh()->name);
+        $this->assertSame('old-secret', $target->fresh()->api_token);
+    }
+
+    #[Test]
+    public function deleting_a_reviewed_target_fails_without_creating_a_replacement(): void
+    {
+        $target = $this->target([
+            'name' => 'Before review',
+            'email' => 'existing@example.test',
+            'api_token' => 'old-secret',
+            'department' => 'Sales',
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nImported name,existing@example.test,new-secret,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $target->delete();
+
+        $result = $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
+
+        $this->assertSame('failed', $result['execution_status']);
+        $this->assertSame('target_changed_after_preview', $row->fresh()->last_error_code);
+        $this->assertDatabaseCount('import_target_models', 0);
+    }
+
+    #[Test]
+    public function unchanged_upsert_rows_are_skipped_without_firing_target_update_events(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'existing@example.test',
+            'api_token' => 'same-secret',
+            'department' => 'Sales',
+        ]);
+        $updatedEvents = 0;
+        Event::listen('eloquent.updated: '.ImportTargetModel::class, function () use (&$updatedEvents): void {
+            $updatedEvents++;
+        });
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm(
+            $actor,
+            "Name,Email,API token,Department\nExisting contact,existing@example.test,same-secret,Sales\n",
+        );
+        $row = $session->rows()->firstOrFail();
+        $result = $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
+
+        $this->assertSame('skipped', $result['execution_status']);
+        $this->assertSame('unchanged', $row->fresh()->preview['reason']);
+        $this->assertSame(0, $updatedEvents);
+        $this->assertSame(1, $session->fresh()->skipped_count);
+        $this->assertSame(0, $session->fresh()->updated_count);
+    }
+
+    #[Test]
+    public function equivalent_boolean_target_value_is_skipped_without_saving_the_target(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 1,
+        ]);
+        $updatedEvents = 0;
+        Event::listen('eloquent.updated: '.ImportTargetModel::class, function () use (&$updatedEvents): void {
+            $updatedEvents++;
+        });
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm(
+            $actor,
+            "Name,Email,Active\nExisting contact,active@example.test,1\n",
+            mapping: [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+        $row = $session->rows()->firstOrFail();
+
+        $result = app(ImportExecutionService::class)->processRow(
+            (string) $session->getKey(),
+            (int) $row->getKey(),
+            (int) $session->confirmed_revision,
+        );
+
+        $this->assertSame('skipped', $result['execution_status']);
+        $this->assertSame('unchanged', $row->fresh()->preview['reason']);
+        $this->assertSame(0, $updatedEvents);
+        $this->assertSame(1, $session->fresh()->skipped_count);
+        $this->assertSame(0, $session->fresh()->updated_count);
+        $this->assertSame(1, $target->fresh()->getRawOriginal('is_active'));
+    }
+
+    #[Test]
+    public function a_real_boolean_value_change_is_written_after_review(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 0,
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm(
+            $actor,
+            "Name,Email,Active\nExisting contact,active@example.test,1\n",
+            mapping: [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+        $row = $session->rows()->firstOrFail();
+
+        $result = app(ImportExecutionService::class)->processRow(
+            (string) $session->getKey(),
+            (int) $row->getKey(),
+            (int) $session->confirmed_revision,
+        );
+
+        $this->assertSame('updated', $result['execution_status']);
+        $this->assertSame(1, $target->fresh()->getRawOriginal('is_active'));
+        $this->assertSame(1, $session->fresh()->updated_count);
+    }
+
+    #[Test]
+    public function a_boolean_target_changed_after_review_fails_the_strict_snapshot_check(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 0,
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm(
+            $actor,
+            "Name,Email,Active\nChanged name,active@example.test,1\n",
+            mapping: [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+        $row = $session->rows()->firstOrFail();
+        $target->forceFill(['is_active' => 1])->save();
+
+        $result = app(ImportExecutionService::class)->processRow(
+            (string) $session->getKey(),
+            (int) $row->getKey(),
+            (int) $session->confirmed_revision,
+        );
+
+        $this->assertSame('failed', $result['execution_status']);
+        $this->assertSame('target_changed_after_preview', $row->fresh()->last_error_code);
+        $this->assertSame('Existing contact', $target->fresh()->name);
+        $this->assertSame(1, $target->fresh()->getRawOriginal('is_active'));
+    }
+
+    #[Test]
+    public function a_confirmed_legacy_boolean_update_keeps_its_reviewed_action(): void
+    {
+        $target = $this->target([
+            'name' => 'Existing contact',
+            'email' => 'active@example.test',
+            'is_active' => 1,
+        ]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = app(FileIntakeService::class)->upload(
+            UploadedFile::fake()->createWithContent(
+                'contacts.csv',
+                "Name,Email,Active\nExisting contact,active@example.test,1\n",
+            ),
+            $actor,
+        );
+        $session = app(ImportStagingService::class)->start(
+            (string) $session->getKey(),
+            $actor,
+            'preview-contacts',
+            0,
+            1,
+            [1 => 'name', 2 => 'email', 3 => 'is_active'],
+        );
+        (new StageImportJob((string) $session->getKey(), 1, 1))->handle(app(ImportStagingService::class));
+        $session = $session->fresh();
+        $previewService = app(ImportPreviewService::class);
+        $previewService->generate((string) $session->getKey(), $actor);
+        $row = $session->rows()->firstOrFail();
+        $legacyPreview = $row->preview;
+        $legacyPreview['action'] = 'update';
+        unset($legacyPreview['reason']);
+        DB::table('smart_import_rows')->where('id', $row->getKey())->update([
+            'preview' => json_encode($legacyPreview, JSON_THROW_ON_ERROR),
+        ]);
+        $confirmed = $previewService->confirm(
+            (string) $session->getKey(),
+            $actor,
+            (int) $session->staging_revision,
+        );
+        $updatedEvents = 0;
+        Event::listen('eloquent.updated: '.ImportTargetModel::class, function () use (&$updatedEvents): void {
+            $updatedEvents++;
+        });
+
+        $result = app(ImportExecutionService::class)->processRow(
+            (string) $confirmed->getKey(),
+            (int) $row->getKey(),
+            (int) $confirmed->confirmed_revision,
+        );
+
+        $this->assertSame('updated', $result['execution_status']);
+        $this->assertSame(0, $updatedEvents);
+        $this->assertSame(1, $confirmed->fresh()->updated_count);
+        $this->assertSame(1, $target->fresh()->getRawOriginal('is_active'));
+    }
+
+    #[Test]
     public function duplicate_file_rows_are_counted_as_failures_without_target_writes(): void
     {
         $actor = new GenericUser(['id' => 7]);
         $session = $this->confirm(
             $actor,
             "Name,Email,API token,Department\nFirst,duplicate@example.test,one,Sales\nSecond,duplicate@example.test,two,Sales\n",
+            forceValidRowsAfterStaging: true,
         );
 
         foreach ($session->rows()->orderBy('id')->get() as $row) {
@@ -303,6 +584,7 @@ class ImportExecutionServiceTest extends TestCase
         $session = $this->confirm(
             $actor,
             "Name,Email,API token,Department\nAda,ada@example.test,ada-token,Sales\nGrace,not-an-email,grace-token,Support\n",
+            forceValidRowsAfterStaging: true,
         );
         $rows = $session->rows()->orderBy('source_row_number')->get();
         $job = new ExecuteImportChunkJob(
@@ -353,6 +635,78 @@ class ImportExecutionServiceTest extends TestCase
         $this->assertSame(2, $retried->attempt_history[0]['processed']);
         $this->assertSame('failed_rows_only', $retried->attempt_history[1]['retry']);
         $this->assertSame('completed', $retried->attempt_history[1]['status']);
+        $retryAudit = ImportAuditEntry::query()
+            ->where('import_id', $session->getKey())
+            ->where('event', 'import.retry_started')
+            ->sole();
+        $this->assertSame(2, $retryAudit->attempt_id);
+        $this->assertSame(['attempt_id' => 2, 'retry_of_attempt' => 1, 'execution_total' => 1], $retryAudit->metadata);
+    }
+
+    #[Test]
+    public function failed_row_retry_updates_large_attempts_in_bounded_locked_batches(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nAda,ada@example.test,ada-token,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $row->forceFill([
+            'execution_status' => 'failed',
+            'last_error_code' => 'temporary_failure',
+            'last_error_message' => 'Safe test failure.',
+            'completed_at' => now(),
+        ])->save();
+
+        $attributes = $row->fresh()->getAttributes();
+        unset($attributes['id']);
+        $now = now();
+        $attributes['execution_status'] = 'failed';
+        $attributes['last_error_code'] = 'temporary_failure';
+        $attributes['last_error_message'] = 'Safe test failure.';
+        $attributes['completed_at'] = $now;
+        $attributes['created_at'] = $now;
+        $attributes['updated_at'] = $now;
+        $additionalRows = [];
+
+        for ($sourceRow = 3; $sourceRow <= 502; $sourceRow++) {
+            $additionalRows[] = array_merge($attributes, ['source_row_number' => $sourceRow]);
+        }
+
+        foreach (array_chunk($additionalRows, 50) as $chunk) {
+            DB::table('smart_import_rows')->insert($chunk);
+        }
+
+        $session->forceFill([
+            'status' => ImportStatus::Completed,
+            'execution_total' => 501,
+            'processed' => 501,
+            'created_count' => 0,
+            'updated_count' => 0,
+            'skipped_count' => 0,
+            'failed_count' => 501,
+            'finished_at' => now(),
+        ])->save();
+
+        $rowUpdateQueries = 0;
+        DB::listen(static function ($query) use (&$rowUpdateQueries): void {
+            $sql = strtolower(ltrim($query->sql));
+
+            if (str_starts_with($sql, 'update') && str_contains($sql, 'smart_import_rows')) {
+                $rowUpdateQueries++;
+            }
+        });
+
+        $retrying = $this->app->make(ImportRetryService::class)->retryFailedRows((string) $session->getKey(), $actor);
+
+        $this->assertSame(ImportStatus::Queued, $retrying->status);
+        $this->assertSame(501, $retrying->execution_total);
+        $this->assertSame(501, $session->rows()->where('execution_status', 'pending')->count());
+        $this->assertSame(0, $session->rows()->whereNotNull('last_error_code')->count());
+        $this->assertLessThanOrEqual(3, $rowUpdateQueries, 'Failed rows must be reset in 250-row batches, not one update per row.');
+        $retryJobs = Queue::pushed(ExecuteImportChunkJob::class, fn (ExecuteImportChunkJob $job): bool =>
+            $job->sessionId === (string) $session->getKey() && $job->attemptId === 2
+        );
+        $this->assertCount(6, $retryJobs);
+        $this->assertSame(501, $retryJobs->sum(fn (ExecuteImportChunkJob $job): int => count($job->rowIds)));
     }
 
     #[Test]
@@ -487,6 +841,7 @@ class ImportExecutionServiceTest extends TestCase
         string $contents,
         string $importerKey = 'preview-contacts',
         array $mapping = [1 => 'name', 2 => 'email', 3 => 'api_token', 4 => 'department'],
+        bool $forceValidRowsAfterStaging = false,
     ): ImportSession {
         $file = UploadedFile::fake()->createWithContent('contacts.csv', $contents);
         $session = $this->app->make(FileIntakeService::class)->upload($file, $actor);
@@ -500,11 +855,15 @@ class ImportExecutionServiceTest extends TestCase
         );
         (new StageImportJob((string) $session->getKey(), 1, 1))->handle($this->app->make(ImportStagingService::class));
 
+        if ($forceValidRowsAfterStaging) {
+            $staging->rows()->update(['validation_status' => 'valid', 'validation_errors' => null]);
+        }
+
         $staging = $staging->fresh();
         $previews = $this->app->make(ImportPreviewService::class);
         $previews->generate((string) $staging->getKey(), $actor);
 
-        return $previews->confirm((string) $staging->getKey(), $actor);
+        return $previews->confirm((string) $staging->getKey(), $actor, (int) $staging->staging_revision);
     }
 
     /** @param array<string, mixed> $attributes */

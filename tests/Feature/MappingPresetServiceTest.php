@@ -51,14 +51,17 @@ class MappingPresetServiceTest extends TestCase
             [1 => 'Name', 2 => 'E-mail', 3 => 'Notes'],
             [1 => 'name', 2 => 'email', 3 => null],
             new GenericUser(['id' => 7]),
-            ['delimiter' => ';', 'encoding' => 'UTF-8'],
+            ['reader' => ['csv_delimiter' => ';', 'csv_encoding' => 'UTF-8']],
         );
 
         $this->assertSame('contacts', $preset->importer_key);
         $this->assertSame('1', $preset->importer_version);
         $this->assertSame('Contact import', $preset->name);
         $this->assertSame([1 => 'name', 2 => 'email', 3 => null], $preset->mapping);
-        $this->assertSame(['delimiter' => ';', 'encoding' => 'UTF-8'], $preset->options);
+        $this->assertSame([
+            'reader' => ['csv_delimiter' => ';', 'csv_encoding' => 'UTF-8'],
+            'importer' => [],
+        ], $preset->options);
         $this->assertSame(GenericUser::class, $preset->created_by_type);
         $this->assertSame('7', $preset->created_by_id);
         $this->assertSame(64, strlen($preset->source_fingerprint));
@@ -83,6 +86,7 @@ class MappingPresetServiceTest extends TestCase
             2,
             [3 => 'Notes', 1 => 'Name', 2 => 'E-mail'],
             $actor,
+            ['reader' => ['csv_delimiter' => null, 'csv_encoding' => 'guess']],
         );
 
         $this->assertTrue($compatible['compatible']);
@@ -130,6 +134,84 @@ class MappingPresetServiceTest extends TestCase
         $this->assertFalse($resolved['compatible']);
         $this->assertSame('source_fingerprint', $resolved['incompatibility']);
         $this->assertNull($resolved['mapping']);
+    }
+
+    #[Test]
+    public function csv_reader_options_are_frozen_and_must_match_before_a_preset_can_be_applied(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $headers = [1 => 'Name', 2 => 'E-mail'];
+        $preset = $this->service()->save(
+            'contacts',
+            'Semicolon contacts',
+            0,
+            'Contacts',
+            1,
+            $headers,
+            [1 => 'name', 2 => 'email'],
+            $actor,
+            ['reader' => ['csv_delimiter' => ';', 'csv_encoding' => 'UTF-8']],
+        );
+
+        $resolved = $this->service()->resolve(
+            $preset->id,
+            'contacts',
+            0,
+            'Contacts',
+            1,
+            $headers,
+            $actor,
+            ['reader' => ['csv_delimiter' => ';', 'csv_encoding' => 'UTF-8']],
+        );
+
+        $this->assertTrue($resolved['compatible']);
+        $this->assertSame(';', $resolved['options']['reader']['csv_delimiter']);
+        $this->assertSame('UTF-8', $resolved['options']['reader']['csv_encoding']);
+
+        $incompatible = $this->service()->resolve(
+            $preset->id,
+            'contacts',
+            0,
+            'Contacts',
+            1,
+            $headers,
+            $actor,
+            ['reader' => ['csv_delimiter' => ',', 'csv_encoding' => 'UTF-8']],
+        );
+
+        $this->assertFalse($incompatible['compatible']);
+        $this->assertSame('reader_options', $incompatible['incompatibility']);
+        $this->assertNull($incompatible['mapping']);
+    }
+
+    #[Test]
+    public function duplicate_header_mappings_keep_their_original_source_column_indexes(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $headers = [1 => 'Name', 2 => 'Name', 3 => 'E-mail'];
+        $preset = $this->service()->save(
+            'contacts',
+            'Duplicate labels',
+            0,
+            'Contacts',
+            1,
+            $headers,
+            [1 => 'name', 2 => null, 3 => 'email'],
+            $actor,
+        );
+
+        $resolved = $this->service()->resolve(
+            $preset->id,
+            'contacts',
+            0,
+            'Contacts',
+            1,
+            $headers,
+            $actor,
+        );
+
+        $this->assertTrue($resolved['compatible']);
+        $this->assertSame([1 => 'name', 2 => null, 3 => 'email'], $resolved['mapping']);
     }
 
     #[Test]

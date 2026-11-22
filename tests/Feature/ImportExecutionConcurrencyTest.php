@@ -39,6 +39,8 @@ class ImportExecutionConcurrencyTest extends TestCase
             self::$sharedSqlitePath = sys_get_temp_dir().'/smart-import-execution-'.bin2hex(random_bytes(8)).'.sqlite';
             $app['config']->set("database.connections.{$connectionName}.database", self::$sharedSqlitePath);
             putenv('SMART_IMPORT_RACE_SQLITE_PATH='.self::$sharedSqlitePath);
+            putenv('SMART_IMPORT_INDEX_KEY='.str_repeat('k', 32));
+            $app['config']->set('smart-import.security.index_key', str_repeat('k', 32));
         }
     }
 
@@ -52,6 +54,7 @@ class ImportExecutionConcurrencyTest extends TestCase
 
         self::$sharedSqlitePath = null;
         putenv('SMART_IMPORT_RACE_SQLITE_PATH');
+        putenv('SMART_IMPORT_INDEX_KEY');
     }
 
     #[Test]
@@ -215,6 +218,7 @@ class ImportExecutionConcurrencyTest extends TestCase
             'staging_revision' => 1,
             'confirmed_revision' => 1,
             'execution_total' => 1,
+            'options' => ['security' => ['index_hash_version' => 2]],
         ]);
         $session->save();
         $decision = $definition->writePolicy()->decisionFor($match['change_type']);

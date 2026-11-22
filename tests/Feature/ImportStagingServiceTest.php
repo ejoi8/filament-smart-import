@@ -7,6 +7,7 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
@@ -16,12 +17,14 @@ use SmartImport\Jobs\StageImportJob;
 use SmartImport\Models\ImportRow;
 use SmartImport\Services\FileIntakeService;
 use SmartImport\Services\ImportCoordinator;
+use SmartImport\Services\ImportPayloadCodec;
 use SmartImport\Services\ImporterRegistry;
 use SmartImport\Services\ImportStagingService;
 use SmartImport\Services\StagedRowService;
 use SmartImport\Tests\Fixtures\BlankValueImportDefinition;
 use SmartImport\Tests\Fixtures\CompositeStagingImportDefinition;
 use SmartImport\Tests\Fixtures\ImportTargetModel;
+use SmartImport\Tests\Fixtures\PreviewImportDefinition;
 use SmartImport\Tests\Fixtures\StagingImportDefinition;
 use SmartImport\Tests\TestCase;
 
@@ -101,6 +104,115 @@ class ImportStagingServiceTest extends TestCase
         $this->assertSame(['name', 'email'], array_column($invalidRow->validation_errors, 'field'));
         $this->assertSame([3, 3], array_column($invalidRow->validation_errors, 'source_row'));
         $this->assertSame('pending', $validRow->execution_status);
+    }
+
+    #[Test]
+    public function staging_uses_and_persists_the_same_csv_reader_settings_selected_for_preview(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->upload("Name;Email\nAda;ada@example.test\n", $actor);
+
+        $staging = $this->staging()->start(
+            (string) $session->getKey(),
+            $actor,
+            'staging-contacts',
+            0,
+            1,
+            [1 => 'name', 2 => 'email'],
+            ['csv_delimiter' => ';', 'csv_encoding' => 'UTF-8'],
+        );
+
+        $this->assertSame(';', $staging->options['reader']['csv_delimiter']);
+        $this->assertSame('UTF-8', $staging->options['reader']['csv_encoding']);
+
+        (new StageImportJob((string) $staging->getKey(), $staging->mapping_revision, $staging->staging_revision))
+            ->handle($this->staging());
+
+        $row = $staging->rows()->firstOrFail();
+        $this->assertSame('Ada', $row->normalized_values['name']);
+        $this->assertSame('ada@example.test', $row->normalized_values['email']);
+        $this->assertSame(ImportStatus::ReviewReady, $staging->fresh()->status);
+    }
+
+    #[Test]
+    public function sensitive_staged_cells_are_encrypted_while_safe_projections_can_read_them(): void
+    {
+        config()->set('smart-import.importers', [PreviewImportDefinition::class]);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->upload("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-STAGED-TOKEN,Sales\n", $actor);
+        $staging = $this->staging()->start(
+            (string) $session->getKey(),
+            $actor,
+            'preview-contacts',
+            0,
+            1,
+            [1 => 'name', 2 => 'email', 3 => 'api_token', 4 => 'department'],
+        );
+
+        (new StageImportJob((string) $staging->getKey(), $staging->mapping_revision, $staging->staging_revision))
+            ->handle($this->staging());
+
+        $row = $staging->rows()->firstOrFail();
+        $storedValues = DB::table('smart_import_rows')->where('id', $row->getKey())->first();
+        $serialized = json_encode([
+            $storedValues->raw_values,
+            $storedValues->mapped_values,
+            $storedValues->normalized_values,
+        ], JSON_THROW_ON_ERROR);
+
+        $this->assertStringNotContainsString('PRIVATE-STAGED-TOKEN', $serialized);
+        $this->assertSame('PRIVATE-STAGED-TOKEN', app(ImportPayloadCodec::class)->reveal($row->raw_values)[3]);
+        $this->assertSame('PRIVATE-STAGED-TOKEN', app(ImportPayloadCodec::class)->reveal($row->mapped_values)['api_token']);
+        $this->assertSame('PRIVATE-STAGED-TOKEN', app(ImportPayloadCodec::class)->reveal($row->normalized_values)['api_token']);
+        $this->assertSame(2, $staging->fresh()->options['security']['index_hash_version']);
+        $this->assertSame(ImportStatus::ReviewReady, $staging->fresh()->status);
+    }
+
+    #[Test]
+    public function staging_rejects_unapproved_reader_options_before_queueing(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->upload("Name,Email\nAda,ada@example.test\n", $actor);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported Smart Import reader option');
+        $this->staging()->start(
+            (string) $session->getKey(),
+            $actor,
+            'staging-contacts',
+            0,
+            1,
+            [1 => 'name', 2 => 'email'],
+            ['csv_delimiter' => ';', 'forged_target' => 'name'],
+        );
+    }
+
+    #[Test]
+    public function staging_rejects_the_sync_queue_before_changing_session_state(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->upload("Name,Email\nAda,ada@example.test\n", $actor);
+        config()->set('queue.default', 'sync');
+        config()->set('queue.connections.sync.driver', 'sync');
+        $this->app->detectEnvironment(static fn (): string => 'production');
+
+        try {
+            $this->staging()->start(
+                (string) $session->getKey(),
+                $actor,
+                'staging-contacts',
+                0,
+                1,
+                [1 => 'name', 2 => 'email'],
+            );
+            $this->fail('Staging must reject an inline queue before transitioning the session.');
+        } catch (\DomainException $exception) {
+            $this->assertStringContainsString('sync driver would block', $exception->getMessage());
+            $this->assertNull($session->fresh()->status);
+            Queue::assertNotPushed(StageImportJob::class);
+        } finally {
+            $this->app->detectEnvironment(static fn (): string => 'testing');
+        }
     }
 
     #[Test]
@@ -214,7 +326,7 @@ class ImportStagingServiceTest extends TestCase
         $row = $session->rows()->firstOrFail();
         $this->assertSame('new', $row->change_type);
 
-        $edited = $this->stagedRows()->edit((string) $session->getKey(), $row->id, 'email', 'ada@example.test', $actor);
+        $edited = $this->stagedRows()->edit((string) $session->getKey(), $row->id, 'email', 'ada@example.test', $actor, (int) $session->staging_revision);
 
         $this->assertSame('matched', $edited->change_type);
         $this->assertSame((string) $existingTarget->getKey(), $edited->resolved_target_id);
@@ -341,7 +453,7 @@ class ImportStagingServiceTest extends TestCase
         $rows = $session->rows()->orderBy('source_row_number')->get();
         $rawValues = $rows[0]->raw_values;
 
-        $edited = $this->stagedRows()->edit((string) $session->getKey(), $rows[0]->id, 'email', 'grace@example.test', $actor);
+        $edited = $this->stagedRows()->edit((string) $session->getKey(), $rows[0]->id, 'email', 'grace@example.test', $actor, (int) $session->staging_revision);
 
         $this->assertSame('invalid', $edited->validation_status);
         $this->assertContains('duplicate_in_file', array_column($edited->validation_errors, 'code'));
@@ -352,7 +464,7 @@ class ImportStagingServiceTest extends TestCase
         $this->assertCount(2, $this->stagedRows()->rows((string) $session->getKey(), $actor, 'invalid'));
         $this->assertCount(0, $this->stagedRows()->rows((string) $session->getKey(), $actor, 'valid'));
 
-        $edited = $this->stagedRows()->edit((string) $session->getKey(), $rows[0]->id, 'email', 'ada@example.test', $actor);
+        $edited = $this->stagedRows()->edit((string) $session->getKey(), $rows[0]->id, 'email', 'ada@example.test', $actor, (int) $session->fresh()->staging_revision);
 
         $this->assertSame('valid', $edited->validation_status);
         $this->assertSame([], $edited->validation_errors);
@@ -371,7 +483,7 @@ class ImportStagingServiceTest extends TestCase
         $row = $session->rows()->firstOrFail();
         $rawValues = $row->raw_values;
 
-        $edited = $this->stagedRows()->edit((string) $session->getKey(), $row->id, 'email', 'invalid-address', $actor);
+        $edited = $this->stagedRows()->edit((string) $session->getKey(), $row->id, 'email', 'invalid-address', $actor, (int) $session->staging_revision);
 
         $this->assertSame('invalid', $edited->validation_status);
         $this->assertSame('email', $edited->validation_errors[0]['code']);

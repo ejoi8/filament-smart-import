@@ -14,7 +14,9 @@ use Illuminate\Support\Facades\Storage;
 use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Jobs\ExecuteImportChunkJob;
+use SmartImport\Jobs\GenerateImportPreviewJob;
 use SmartImport\Jobs\StageImportJob;
+use SmartImport\Models\ImportAuditEntry;
 use SmartImport\Models\ImportSession;
 use SmartImport\Services\FileIntakeService;
 use SmartImport\Services\ImportExecutionLifecycle;
@@ -82,6 +84,10 @@ class ImportRecoveryServiceTest extends TestCase
         $this->assertSame(1, $session->fresh()->current_attempt);
         $this->assertSame(1, $session->fresh()->recovery_count);
         $this->assertSame(1, $session->fresh()->processed);
+        $this->assertSame(1, ImportAuditEntry::query()
+            ->where('import_id', $session->getKey())
+            ->where('event', 'import.recovery_requeued')
+            ->count());
         Queue::assertPushed(ExecuteImportChunkJob::class, fn (ExecuteImportChunkJob $job): bool =>
             $job->attemptId === 1 && $job->rowIds === [$rows[1]->id], 2);
 
@@ -205,6 +211,91 @@ class ImportRecoveryServiceTest extends TestCase
         $this->assertSame(0, $session->rows()->where('execution_status', 'pending')->count());
     }
 
+    #[Test]
+    public function unusable_old_failures_do_not_starve_newer_recoverable_sessions(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $old = $this->confirm($actor, "Old failed,old@example.test,token,Sales\n");
+        ImportSession::query()->whereKey($old->getKey())->update([
+            'status' => ImportStatus::Failed->value,
+            'confirmed_revision' => 1,
+            'execution_total' => 0,
+            'heartbeat_at' => now()->subHours(3),
+            'updated_at' => now()->subHours(3),
+        ]);
+
+        $recoverable = $this->confirm($actor, "Recover me,recover@example.test,token,Sales\n");
+        ImportSession::query()->whereKey($recoverable->getKey())->update([
+            'status' => ImportStatus::Queued->value,
+            'heartbeat_at' => now()->subHours(2),
+            'updated_at' => now()->subHours(2),
+        ]);
+
+        $counts = app(ImportRecoveryService::class)->recoverStale(limit: 1);
+
+        $this->assertSame(1, $counts['scanned']);
+        $this->assertSame(1, $counts['execution_requeued']);
+        $this->assertSame(1, $recoverable->fresh()->recovery_count);
+        $this->assertSame(ImportStatus::Queued, $recoverable->fresh()->status);
+    }
+
+    #[Test]
+    public function recovery_reconciles_a_failed_session_as_completed_when_all_rows_are_already_terminal(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Ada,ada@example.test,token,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $row->forceFill(['execution_status' => 'created'])->save();
+        ImportSession::query()->whereKey($session->getKey())->update([
+            'status' => ImportStatus::Failed->value,
+            'processed' => 1,
+            'created_count' => 1,
+            'heartbeat_at' => now()->subHour(),
+            'updated_at' => now()->subHour(),
+        ]);
+
+        $counts = app(ImportRecoveryService::class)->recoverStale();
+
+        $this->assertSame(0, $counts['failed']);
+        $this->assertSame(1, $counts['completed']);
+        $this->assertSame(ImportStatus::Completed, $session->fresh()->status);
+    }
+
+    #[Test]
+    public function stale_preview_recovery_rotates_generation_and_ignores_the_old_worker(): void
+    {
+        config()->set('smart-import.preview.async_threshold_rows', 1);
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stageForReview($actor, "Ada,ada@example.test,token,Sales\n");
+        $service = app(ImportPreviewService::class);
+        $service->generateOrQueue((string) $session->getKey(), $actor, (int) $session->staging_revision);
+        $oldJob = Queue::pushed(GenerateImportPreviewJob::class)->first();
+        $oldGeneration = $oldJob->generationId;
+
+        $options = $session->fresh()->options;
+        $options['preview_heartbeat_at'] = now()->subHour()->toIso8601String();
+        $session->forceFill(['options' => $options, 'heartbeat_at' => now()->subHour()])->save();
+
+        $dryRun = app(ImportRecoveryService::class)->recoverStale(100, true);
+        $this->assertSame(1, $dryRun['would_recover']);
+        $this->assertSame(0, $dryRun['preview_requeued']);
+
+        $recovered = app(ImportRecoveryService::class)->recoverStale();
+        $newJob = Queue::pushed(GenerateImportPreviewJob::class)->last();
+
+        $this->assertSame(1, $recovered['preview_requeued']);
+        $this->assertNotSame($oldGeneration, $newJob->generationId);
+        $this->assertSame(1, $session->fresh()->options['preview_recovery_count']);
+        $this->assertSame('building', $session->fresh()->options['preview_state']);
+
+        $oldJob->handle($service);
+        $this->assertSame(0, $session->rows()->whereNotNull('preview')->count());
+
+        $newJob->handle($service);
+        $this->assertSame('ready', $session->fresh()->options['preview_state']);
+        $this->assertSame('create', $service->rows((string) $session->getKey(), $actor)['rows'][0]['preview']['action']);
+    }
+
     private function confirm(GenericUser $actor, string $rows): ImportSession
     {
         $file = UploadedFile::fake()->createWithContent(
@@ -224,6 +315,27 @@ class ImportRecoveryServiceTest extends TestCase
         $preview = app(ImportPreviewService::class);
         $preview->generate((string) $session->getKey(), $actor);
 
-        return $preview->confirm((string) $session->getKey(), $actor);
+        return $preview->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision);
+    }
+
+    private function stageForReview(GenericUser $actor, string $rows): ImportSession
+    {
+        $file = UploadedFile::fake()->createWithContent(
+            'contacts.csv',
+            "Name,Email,API token,Department\n".$rows,
+        );
+        $session = app(FileIntakeService::class)->upload($file, $actor);
+        $staging = app(ImportStagingService::class)->start(
+            (string) $session->getKey(),
+            $actor,
+            'preview-contacts',
+            0,
+            1,
+            [1 => 'name', 2 => 'email', 3 => 'api_token', 4 => 'department'],
+        );
+        (new StageImportJob((string) $staging->getKey(), $staging->mapping_revision, $staging->staging_revision))
+            ->handle(app(ImportStagingService::class));
+
+        return $staging->fresh();
     }
 }

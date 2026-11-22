@@ -41,6 +41,21 @@ The **Import Inbox** is the primary Hub destination. A browser upload uses the s
 
 The Hub table intentionally omits server storage paths. It shows the original filename, source, type, size, checksum, importer, intake/import status, and received time. The mapping page rechecks session scope, `view`, `update`, panel access, and importer use on every server operation.
 
+The mapping page lets operators set CSV delimiter and encoding, choose a header beyond the sample rows, and save or explicitly apply a compatible mapping preset. The importer-aware header detector suggests a sampled row only when it matches enough allowed fields and includes every required field; the operator must choose **Use detected header** or make a manual selection. Presets are actor/tenant scoped and tied to importer version, worksheet, header row, source column indexes, and CSV reader settings. Selecting a preset only checks compatibility; the operator must press **Apply preset** to replace current choices. Importer-defined choices are allowlisted and stored with the staged revision. Write mode, matching key fields, invalid-row rules, and each mapped field's blank-cell behavior are displayed from the importer and cannot be changed by the page.
+
+Resource shortcuts can use `SmartImport\Filament\Actions\SmartImportAction` to open the same inbox with an importer preselected. For example, a ListRecords header may return `SmartImportAction::make('contacts')`, and a table may include it in `recordActions()`. The action is only visible to actors allowed to access the current Hub panel and use that importer. It does not assign the importer or start staging; the operator completes the usual Hub steps.
+
+```php
+use SmartImport\Filament\Actions\SmartImportAction;
+
+protected function getHeaderActions(): array
+{
+    return [SmartImportAction::make('contacts')];
+}
+```
+
+The optional Artisan equivalents are documented in the [CLI workflow](cli.md).
+
 ## Background execution queue
 
 After the operator reviews the persisted database preview and confirms it, the package freezes the confirmed revision, execution row count, attempt number, and queued timestamp. It then dispatches bounded `ExecuteImportChunkJob` jobs after the database transaction commits. Each job carries only the import ID, attempt ID, confirmed revision, and a bounded list of staged row IDs; it does not serialize an Eloquent model, file, or row payload. The first chunk moves the session to `importing`; the last committed row outcome moves it to `completed` and emits one `SmartImport\Events\ImportFinished` event after commit. A completed import can include failed rows; inspect its counters to distinguish row failures from worker failure.

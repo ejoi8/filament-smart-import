@@ -1,6 +1,7 @@
 <x-filament-panels::page>
+    @php($pollSeconds = max(1, min(60, (int) config('smart-import.progress.polling_interval_seconds', 2))))
     @if ($shouldPoll)
-        <div wire:poll.2s="refreshSessions" class="space-y-6">
+        <div wire:poll.{{ $pollSeconds }}s="refreshSessions" class="space-y-6">
     @else
         <div class="space-y-6">
     @endif

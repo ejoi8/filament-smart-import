@@ -93,7 +93,31 @@ final class ContactImport implements ImportDefinition, ImportHooks
 
 Lifecycle hooks are trusted application code. Keep them deterministic before commit, avoid logging row values, and never use them to assign fields outside the importer allowlist.
 
-On a terminal state transition, the package emits one Laravel `SmartImport\Events\ImportFinished` event after commit with the session/attempt IDs, terminal status, and committed result counters. Hosts can subscribe to send Filament/database notifications. Listener exceptions are logged without changing the completed import. Use the attempt ID as an idempotency key in any notification listener.
+### Importer-defined operator choices
+
+An importer can optionally implement `ImportOptionProvider` to offer a small allowlist of safe, non-secret choices in the shared mapping page and CLI. Each `ImportOption` declares a stable key, label, allowed string values, and default. Existing `ImportDefinition` classes do not need to change.
+
+```php
+use SmartImport\Contracts\ImportOptionProvider;
+use SmartImport\Data\ImportOption;
+
+final class ContactImportDefinition implements ImportDefinition, ImportOptionProvider
+{
+    public function importOptions(): array
+    {
+        return [new ImportOption(
+            'source_label',
+            'Source label',
+            ['partner' => 'Partner feed', 'staff' => 'Staff upload'],
+            'partner',
+        )];
+    }
+}
+```
+
+The package validates selections against the registered importer, saves them with the staged revision, and validates them again when staging begins. The optional value is available to importer lifecycle hooks through `ImportSession::$options['importer']` and, for row hooks, `ImportRowContext::$importerOptions`. Use these choices for application-owned hook behavior; they do not change the importer's write mode, key fields, field allowlist, or blank-cell policy. Do not declare secrets or credentials as presettable options.
+
+On each terminal state transition, the package emits a Laravel `SmartImport\Events\ImportFinished` event after commit with the session/attempt IDs, terminal status, and committed result counters. It remains a transition event and may report a technical failure that recovery later reopens. Listener exceptions are logged without changing persisted import state. Use the attempt ID for listener idempotency. For durable package-owned database notifications and a stable external delivery key, use the outbox described in [terminal notifications](notifications.md); outbox delivery does not emit `ImportFinished` again.
 
 ## Missing, blank, and explicit null values
 
@@ -117,7 +141,9 @@ After staging reaches `review_ready`, call `ImportPreviewService::generate($sess
 
 Read preview rows through `ImportPreviewService::rows($sessionId, $actor, page: 1, perPage: 50)`. It returns a paginated projection without raw or mapped spreadsheet values. Editing a staged row clears all saved previews, and a preview from an older mapping or staging revision cannot be read.
 
-After reviewing a complete preview, call `ImportPreviewService::confirm($sessionId, $actor)`. The actor must pass the `queue` Gate for that import session. Confirmation stores `confirmed_revision`, sets the session to `queued`, and freezes importer, mapping, sheet, staging, and row input values. Preview rows remain readable while queued. Confirmation does not dispatch execution jobs yet; the queue worker pipeline is a later phase.
+After reviewing a complete preview, call `ImportPreviewService::confirm($sessionId, $actor, $expectedStagingRevision)`. The actor must pass the `queue` Gate for that import session. Confirmation stores `confirmed_revision`, sets the session to `queued`, and freezes importer, mapping, sheet, staging, row input values, and reviewed row actions. It dispatches bounded execution jobs containing row IDs and the frozen revision. Preview rows remain readable while queued; target writes happen only in the asynchronous queue worker.
+
+For unchanged detection, fields declared with `type: 'bool'` or `type: 'boolean'` use a narrow boolean comparison: `true`, `1`, and `'1'` are equivalent, as are `false`, `0`, and `'0'`. A target model's native Eloquent `bool`/`boolean` cast also enables this rule for that field. Import field metadata takes precedence when it explicitly declares a boolean; other field types keep the existing strict comparison. Values such as `'false'`, `null`, and `''` are not coerced by truthiness and remain distinct. Preview diffs and execution's unchanged check share this comparator. Target snapshot verification remains based on the exact stored target values. A preview already confirmed as an update keeps that reviewed action; this comparison only affects newly generated previews.
 
 The shared `ImportExecutionService::processRow($sessionId, $rowId, $confirmedRevision)` operation executes one confirmed row. It reruns the shared mapping/transform/relationship/validation logic and rechecks duplicate keys and target matches before persisting. It writes only fields declared by the importer, and target changes, row outcome/history, and session counters commit in one transaction. Package session/row tables and the target model must use the same Laravel database connection. A mismatch is rejected before target writes because atomic commits cannot span connections. Queue adapters should dispatch identifiers and the confirmed revision, never model instances or row payloads.
 

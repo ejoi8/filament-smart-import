@@ -15,6 +15,7 @@ use PhpOffice\PhpSpreadsheet\Writer\Xls;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use SmartImport\Enums\IntakeStatus;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Models\ImportAuditEntry;
 use SmartImport\Services\FileIntakeService;
 use SmartImport\Services\ImportCoordinator;
 use SmartImport\Services\SpreadsheetReader;
@@ -126,6 +127,10 @@ class FileIntakeServiceTest extends TestCase
         $this->assertFalse($disk->exists($session->storage_path));
         $this->assertTrue($disk->exists($session->claimed_storage_path));
         $this->assertSame([], $disk->allFiles('smart-import/processing'));
+        $this->assertSame(
+            ['source' => 'sftp', 'file_type' => 'xlsx'],
+            ImportAuditEntry::query()->where('import_id', $session->getKey())->sole()->metadata,
+        );
     }
 
     #[Test]
@@ -369,6 +374,17 @@ class FileIntakeServiceTest extends TestCase
     public function unsupported_extensions_are_rejected(): void
     {
         $file = LaravelUploadedFile::fake()->createWithContent('contacts.txt', "name,email\nAda,ada@example.test\n");
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Only CSV, XLSX, and XLS');
+
+        $this->intake()->upload($file, new GenericUser(['id' => 7]));
+    }
+
+    #[Test]
+    public function macro_enabled_xlsm_workbooks_are_rejected_as_unsupported(): void
+    {
+        $file = LaravelUploadedFile::fake()->createWithContent('contacts.xlsm', "name,email\nAda,ada@example.test\n");
 
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Only CSV, XLSX, and XLS');

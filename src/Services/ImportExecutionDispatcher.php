@@ -29,8 +29,23 @@ final class ImportExecutionDispatcher
             throw new DomainException('The configured Smart Import queue connection is not available.');
         }
 
-        if ($driver === 'sync' && ! app()->environment('testing')) {
+        if (in_array($driver, ['sync', 'null'], true)) {
             throw new DomainException('Smart Import requires an asynchronous Laravel queue connection; the sync driver would block the request.');
+        }
+
+        $chunkSize = (int) config('smart-import.execution.chunk_size', 100);
+        $tries = (int) config('smart-import.execution.job_tries', 3);
+        $backoff = config('smart-import.execution.job_backoff_seconds', [10, 30, 60]);
+
+        if ($chunkSize < 1 || $chunkSize > 1000 || $tries < 1 || $tries > 10) {
+            throw new DomainException('Smart Import execution settings require a chunk size of 1–1000 rows and 1–10 job tries.');
+        }
+
+        if (! is_array($backoff)
+            || ! array_is_list($backoff)
+            || count($backoff) > 8
+            || array_filter($backoff, static fn (mixed $seconds): bool => ! is_int($seconds) || $seconds < 0 || $seconds > 86400) !== []) {
+            throw new DomainException('Smart Import execution backoff must contain no more than eight delays from 0 to 86400 seconds.');
         }
     }
 
@@ -47,6 +62,7 @@ final class ImportExecutionDispatcher
         }
 
         try {
+            $this->assertQueueCanRunAsynchronously();
             $chunkSize = (int) config('smart-import.execution.chunk_size', 100);
 
             if ($chunkSize < 1 || $chunkSize > 1000) {

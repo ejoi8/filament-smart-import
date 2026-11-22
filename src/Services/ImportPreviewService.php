@@ -7,11 +7,15 @@ use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 use InvalidArgumentException;
 use SmartImport\Contracts\ImportDefinition;
+use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Data\ImportField;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Enums\ImportWriteAction;
+use SmartImport\Jobs\GenerateImportPreviewJob;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
 use Throwable;
@@ -30,6 +34,10 @@ final class ImportPreviewService
         private ImporterRegistry $importers,
         private TargetRecordMatcher $targetRecordMatcher,
         private ImportExecutionDispatcher $executionDispatcher,
+        private ImportValueComparator $valueComparator,
+        private ImportExecutionContext $executionContext,
+        private ImportPayloadCodec $payloadCodec,
+        private ImportAuditService $audit,
     ) {}
 
     /**
@@ -41,9 +49,241 @@ final class ImportPreviewService
     public function generate(string $sessionId, Authenticatable $actor): array
     {
         $session = $this->reviewSession($sessionId, $actor, true);
+        $this->authorization->authorize('update', $actor, $session);
         $definition = $this->definition($session);
+        $this->authorization->authorize('useImporter', $actor, $definition);
+        $generationId = (string) Str::uuid();
         $mappingRevision = $session->mapping_revision;
         $stagingRevision = $session->staging_revision;
+        $total = $session->rows()->count();
+
+        $this->markPreviewBuilding($session, $mappingRevision, $stagingRevision, $total, $generationId);
+
+        try {
+            return $this->executionContext->run(
+                $session,
+                fn (): array => $this->buildPreview($session, $mappingRevision, $stagingRevision, $generationId),
+            );
+        } catch (Throwable $exception) {
+            $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * Generate small previews in the request and queue larger previews on the configured async queue.
+     * Both paths call the same bounded preview builder and freeze the same revisions.
+     *
+     * @return array{queued: bool, already_queued: bool, summary: array<string, int>|null}
+     */
+    public function generateOrQueue(string $sessionId, Authenticatable $actor, int $expectedStagingRevision): array
+    {
+        $session = $this->reviewSession($sessionId, $actor, true);
+        $this->authorization->authorize('update', $actor, $session);
+        $definition = $this->definition($session);
+        $this->authorization->authorize('useImporter', $actor, $definition);
+
+        if ($session->staging_revision !== $expectedStagingRevision) {
+            throw new DomainException('This import changed after you opened the review. Refresh before generating a preview.');
+        }
+
+        $total = $session->rows()->count();
+        $threshold = (int) config('smart-import.preview.async_threshold_rows', 1000);
+
+        if ($threshold < 1 || $threshold > 100000) {
+            throw new DomainException('Smart Import preview async threshold must be between 1 and 100000 rows.');
+        }
+
+        if ($total < $threshold) {
+            $summary = $this->generate($sessionId, $actor);
+
+            return ['queued' => false, 'already_queued' => false, 'summary' => $summary];
+        }
+
+        $this->executionDispatcher->assertQueueCanRunAsynchronously();
+        $generationId = (string) Str::uuid();
+        $mappingRevision = $session->mapping_revision;
+        $stagingRevision = $session->staging_revision;
+        $claim = DB::transaction(function () use (
+            $sessionId,
+            $actor,
+            $expectedStagingRevision,
+            $mappingRevision,
+            $stagingRevision,
+            $total,
+            $generationId,
+        ): array {
+            $current = $this->authorization
+                ->applyActorScope(ImportSession::query()->lockForUpdate(), $actor)
+                ->whereKey($sessionId)
+                ->firstOrFail();
+            $this->authorization->authorize('view', $actor, $current);
+            $this->authorization->authorize('update', $actor, $current);
+
+            if ($current->status !== ImportStatus::ReviewReady
+                || $current->staging_revision !== $expectedStagingRevision
+                || $current->mapping_revision !== $mappingRevision) {
+                throw new DomainException('This import changed before its preview could be queued. Refresh the review and try again.');
+            }
+
+            $options = $current->options ?? [];
+
+            if (($options['preview_state'] ?? null) === 'building'
+                && ($options['preview_revision'] ?? null) === $stagingRevision
+                && is_string($options['preview_generation_id'] ?? null)) {
+                return ['generation_id' => $options['preview_generation_id'], 'already_queued' => true];
+            }
+
+            $this->writePreviewBuildingState($current, $mappingRevision, $stagingRevision, $total, $generationId);
+
+            return ['generation_id' => $generationId, 'already_queued' => false];
+        }, 3);
+
+        if (! $claim['already_queued']) {
+            try {
+                $this->dispatchPreview((string) $session->getKey(), $mappingRevision, $stagingRevision, $claim['generation_id']);
+            } catch (Throwable $exception) {
+                $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $claim['generation_id']);
+
+                throw $exception;
+            }
+        }
+
+        return ['queued' => true, 'already_queued' => $claim['already_queued'], 'summary' => null];
+    }
+
+    /** Run a queued preview only when its persisted generation identity is still current. */
+    public function generateQueued(string $sessionId, int $mappingRevision, int $stagingRevision, string $generationId): void
+    {
+        $session = ImportSession::query()->find($sessionId);
+
+        if (! $this->isCurrentGeneration($session, $mappingRevision, $stagingRevision, $generationId)) {
+            return;
+        }
+
+        try {
+            $this->executionContext->run(
+                $session,
+                fn (): array => $this->buildPreview($session, $mappingRevision, $stagingRevision, $generationId),
+            );
+        } catch (Throwable $exception) {
+            $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
+
+            throw $exception;
+        }
+    }
+
+    /** Mark only the matching durable preview generation as failed. */
+    public function failQueuedPreview(string $sessionId, int $mappingRevision, int $stagingRevision, string $generationId): void
+    {
+        $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
+    }
+
+    /** Requeue one stale preview under a new generation identity so an old worker cannot publish over it. */
+    public function recoverStalePreview(string $sessionId, mixed $cutoff, int $maxRecoveries, bool $dryRun): string
+    {
+        if (! $dryRun) {
+            try {
+                $this->executionDispatcher->assertQueueCanRunAsynchronously();
+            } catch (Throwable) {
+                $this->failUnavailablePreviewQueue($sessionId);
+
+                return 'failed';
+            }
+        }
+
+        $result = DB::transaction(function () use ($sessionId, $cutoff, $maxRecoveries, $dryRun): array {
+            $session = ImportSession::query()->lockForUpdate()->find($sessionId);
+
+            if ($session === null || $session->status !== ImportStatus::ReviewReady) {
+                return ['outcome' => 'skipped'];
+            }
+
+            $options = $session->options ?? [];
+            $heartbeat = $options['preview_heartbeat_at'] ?? $session->heartbeat_at;
+
+            if (($options['preview_state'] ?? null) !== 'building'
+                || ($options['preview_revision'] ?? null) !== $session->staging_revision
+                || ($options['preview_mapping_revision'] ?? null) !== $session->mapping_revision
+                || ! is_string($options['preview_generation_id'] ?? null)
+                || $heartbeat === null
+                || Carbon::parse($heartbeat)->greaterThanOrEqualTo($cutoff)) {
+                return ['outcome' => 'skipped'];
+            }
+
+            $recoveries = (int) ($options['preview_recovery_count'] ?? 0);
+
+            if ($recoveries >= $maxRecoveries) {
+                if ($dryRun) {
+                    return ['outcome' => 'would_fail'];
+                }
+
+                $options['preview_state'] = 'failed';
+                $options['preview_error'] = 'The preview recovery limit was reached. Queue workers or the source file may need attention.';
+                $options['preview_heartbeat_at'] = now()->toIso8601String();
+                $session->forceFill(['options' => $options, 'heartbeat_at' => now()])->save();
+
+                return ['outcome' => 'failed'];
+            }
+
+            if ($dryRun) {
+                return ['outcome' => 'would_recover'];
+            }
+
+            $generationId = (string) Str::uuid();
+            $options['preview_generation_id'] = $generationId;
+            $options['preview_recovery_count'] = $recoveries + 1;
+            $options['preview_processed'] = 0;
+            $options['preview_summary'] = null;
+            $options['preview_error'] = null;
+            $options['preview_heartbeat_at'] = now()->toIso8601String();
+            $session->rows()->update(['preview' => null]);
+            $session->forceFill(['options' => $options, 'heartbeat_at' => now()])->save();
+
+            return [
+                'outcome' => 'preview_requeued',
+                'mapping_revision' => $session->mapping_revision,
+                'staging_revision' => $session->staging_revision,
+                'generation_id' => $generationId,
+            ];
+        }, 3);
+
+        if ($result['outcome'] !== 'preview_requeued') {
+            return $result['outcome'];
+        }
+
+        try {
+            $this->dispatchPreview(
+                $sessionId,
+                $result['mapping_revision'],
+                $result['staging_revision'],
+                $result['generation_id'],
+            );
+        } catch (Throwable) {
+            $this->failPreview(
+                $sessionId,
+                $result['mapping_revision'],
+                $result['staging_revision'],
+                $result['generation_id'],
+            );
+
+            return 'failed';
+        }
+
+        return 'preview_requeued';
+    }
+
+    /**
+     * @return array{staging_revision: int, total: int, create: int, update: int, skip: int, fail: int}
+     */
+    private function buildPreview(ImportSession $session, int $mappingRevision, int $stagingRevision, string $generationId): array
+    {
+        if (! $this->isCurrentGeneration($session->fresh(), $mappingRevision, $stagingRevision, $generationId)) {
+            throw new DomainException('The staged import changed before its preview worker started.');
+        }
+
+        $definition = $this->definition($session);
         $counts = [
             'staging_revision' => $stagingRevision,
             'total' => $session->rows()->count(),
@@ -53,18 +293,24 @@ final class ImportPreviewService
             'fail' => 0,
         ];
 
+        // A queued retry recomputes the full immutable revision. Partial previews are never confirmable.
+        $this->restartPreviewRun($session, $mappingRevision, $stagingRevision, $generationId, $counts['total']);
+
         $session->rows()->orderBy('id')->chunkById(self::ROW_BATCH_SIZE, function ($rows) use (
             $session,
             $definition,
             $mappingRevision,
             $stagingRevision,
+            $generationId,
             &$counts,
         ): void {
+            // Eloquent collections are keyed by model primary key; these arrays are position-indexed.
+            $rows = $rows->values();
             $normalizedRows = [];
 
             foreach ($rows as $row) {
                 $normalizedRows[] = in_array($row->validation_status, ['valid', 'warning'], true)
-                    ? ($row->normalized_values ?? [])
+                    ? $this->payloadCodec->reveal($row->normalized_values)
                     : [];
             }
 
@@ -74,6 +320,7 @@ final class ImportPreviewService
 
             foreach ($rows as $index => $row) {
                 $preview = $this->previewDecision($definition, $row, $matches[$index]);
+                $normalizedValues = $this->payloadCodec->reveal($row->normalized_values);
                 $decisions[$index] = $preview;
 
                 if ($preview['action'] === ImportWriteAction::Update->value && $preview['target_id'] !== null) {
@@ -86,23 +333,36 @@ final class ImportPreviewService
 
             foreach ($rows as $index => $row) {
                 $preview = $decisions[$index];
+                $normalizedValues = $this->payloadCodec->reveal($row->normalized_values);
 
                 if ($preview['action'] === ImportWriteAction::Update->value) {
                     $target = $targets[$preview['target_id']] ?? null;
 
                     if (! $target instanceof Model) {
                         $preview = $this->failedPreview('target_unavailable');
-                    } elseif (! $this->targetRecordMatcher->matchesKey($definition, $row->normalized_values ?? [], $target)) {
+                    } elseif (! $this->targetRecordMatcher->matchesKey($definition, $normalizedValues, $target)) {
                         $preview = $this->failedPreview('target_changed_after_match');
                     } else {
+                        $preview['target_snapshot'] = [
+                            'version' => 1,
+                            'token' => $this->valueComparator->targetSnapshotToken(
+                                $target,
+                                array_keys($normalizedValues),
+                            ),
+                        ];
                         $preview['changes'] = $this->changes(
                             $definition,
-                            $row->normalized_values ?? [],
+                            $normalizedValues,
                             $target,
                         );
+
+                        if ($preview['changes'] === []) {
+                            $preview['action'] = ImportWriteAction::Skip->value;
+                            $preview['reason'] = 'unchanged';
+                        }
                     }
                 } elseif ($preview['action'] === ImportWriteAction::Create->value) {
-                    $preview['changes'] = $this->changes($definition, $row->normalized_values ?? []);
+                    $preview['changes'] = $this->changes($definition, $normalizedValues);
                 }
 
                 $preview['staging_revision'] = $stagingRevision;
@@ -111,10 +371,11 @@ final class ImportPreviewService
                 $persist[] = [$row, $preview];
             }
 
-            $this->persistBatch($session, $mappingRevision, $stagingRevision, $persist);
+            $this->persistBatch($session, $mappingRevision, $stagingRevision, $generationId, $persist);
         });
 
-        $this->assertRevisionCurrent($session, $mappingRevision, $stagingRevision);
+        $this->assertRevisionCurrent($session, $mappingRevision, $stagingRevision, $generationId);
+        $this->markPreviewReady($session, $mappingRevision, $stagingRevision, $generationId, $counts);
 
         return $counts;
     }
@@ -129,46 +390,146 @@ final class ImportPreviewService
         Authenticatable $actor,
         int $page = 1,
         int $perPage = 50,
+        ?string $validationStatus = null,
+        ?string $changeType = null,
+        bool $duplicatesOnly = false,
+        bool $allowMissingPreview = false,
     ): array {
         if ($page < 1 || $perPage < 1 || $perPage > self::MAX_PAGE_SIZE) {
             throw new InvalidArgumentException(sprintf('Preview pagination must use a positive page and 1 to %d rows per page.', self::MAX_PAGE_SIZE));
         }
 
+        if ($validationStatus !== null && ! in_array($validationStatus, ['valid', 'invalid', 'warning'], true)) {
+            throw new InvalidArgumentException('The requested row validation status is not supported.');
+        }
+
+        if ($changeType !== null && ! in_array($changeType, ['new', 'matched', 'ambiguous'], true)) {
+            throw new InvalidArgumentException('The requested row change type is not supported.');
+        }
+
         $session = $this->reviewSession($sessionId, $actor);
         $definition = $this->definition($session);
+        $this->authorization->authorize('useImporter', $actor, $definition);
         $query = $session->rows()->orderBy('source_row_number')->orderBy('id');
+
+        if ($validationStatus !== null) {
+            $query->where('validation_status', $validationStatus);
+        }
+
+        if ($changeType !== null) {
+            $query->where('change_type', $changeType);
+        }
+
+        if ($duplicatesOnly) {
+            $query->whereJsonContains('validation_errors', ['code' => 'duplicate_in_file']);
+        }
+
         $total = (clone $query)->count();
 
-        if ((clone $query)->whereNull('preview')->exists()) {
+        if (! $allowMissingPreview && $session->rows()->whereNull('preview')->exists()) {
             throw new DomainException('Generate a current preview before reading preview rows.');
         }
 
         $pageRows = $query
             ->offset(($page - 1) * $perPage)
             ->limit($perPage)
-            ->get(['id', 'source_row_number', 'validation_status', 'preview']);
+            ->get([
+                'id',
+                'source_row_number',
+                'validation_status',
+                'execution_status',
+                'change_type',
+                'mapped_values',
+                'validation_errors',
+                'warnings',
+                'preview',
+            ]);
         $sensitiveAccess = $this->sensitiveFieldAccess($definition, $session, $actor);
+        $fields = [];
+
+        foreach ($definition->fields() as $field) {
+            if ($field instanceof ImportField) {
+                $fields[$field->name] = $field;
+            }
+        }
+
         $output = [];
 
         foreach ($pageRows as $row) {
             $preview = $row->preview;
 
-            if (! is_array($preview)
-                || ($preview['staging_revision'] ?? null) !== $session->staging_revision
-                || ($preview['mapping_revision'] ?? null) !== $session->mapping_revision) {
+            if (is_array($preview)
+                && (($preview['staging_revision'] ?? null) !== $session->staging_revision
+                    || ($preview['mapping_revision'] ?? null) !== $session->mapping_revision)) {
                 throw new DomainException('The saved preview is stale; generate a new preview before continuing.');
+            }
+
+            if (! is_array($preview) && ! $allowMissingPreview) {
+                throw new DomainException('Generate a current preview before reading preview rows.');
+            }
+
+            $validationErrors = collect($row->validation_errors ?? [])
+                ->filter(static fn (mixed $error): bool => is_array($error))
+                ->map(fn (array $error): array => [
+                    'field' => is_string($error['field'] ?? null) ? $error['field'] : null,
+                    'code' => is_string($error['code'] ?? null) ? $error['code'] : 'validation_failed',
+                    'message' => $this->safeValidationMessage(is_string($error['code'] ?? null) ? $error['code'] : 'validation_failed'),
+                ])
+                ->values()
+                ->all();
+            $mappedValues = [];
+            $storedMappedValues = $row->mapped_values;
+            $storedFieldNames = $this->payloadCodec->keys($storedMappedValues);
+            $readableFieldNames = array_keys(array_filter(
+                $fields,
+                fn (ImportField $field): bool => ! $field->sensitive || ($sensitiveAccess[$field->name] ?? false),
+            ));
+            $readableMappedValues = $this->payloadCodec->reveal($storedMappedValues, $readableFieldNames);
+
+            foreach ($storedFieldNames as $fieldName) {
+                if (! is_string($fieldName) || ! isset($fields[$fieldName])) {
+                    continue;
+                }
+
+                $mappedValues[$fieldName] = $fields[$fieldName]->sensitive && ! ($sensitiveAccess[$fieldName] ?? false)
+                    ? self::REDACTED
+                    : $this->safeReviewValue($readableMappedValues[$fieldName] ?? null);
             }
 
             $output[] = [
                 'id' => (int) $row->getKey(),
                 'source_row_number' => $row->source_row_number,
                 'validation_status' => $row->validation_status,
-                'preview' => $this->revealSensitiveValues($preview, $sensitiveAccess),
+                'execution_status' => (string) $row->execution_status,
+                'change_type' => is_string($row->change_type) ? $row->change_type : null,
+                'mapped_values' => $mappedValues,
+                'validation_errors' => $validationErrors,
+                'warning_count' => is_array($row->warnings) ? count($row->warnings) : 0,
+                'preview' => is_array($preview) ? $this->revealSensitiveValues($preview, $sensitiveAccess) : null,
             ];
         }
 
+        $options = $session->options ?? [];
+
         return [
             'staging_revision' => $session->staging_revision,
+            'preview_state' => ($options['preview_revision'] ?? null) === $session->staging_revision
+                && ($options['preview_mapping_revision'] ?? null) === $session->mapping_revision
+                ? ($options['preview_state'] ?? null)
+                : null,
+            'preview_processed' => (int) ($options['preview_processed'] ?? 0),
+            'preview_total' => (int) ($options['preview_total'] ?? $session->rows()->count()),
+            'preview_summary' => is_array($options['preview_summary'] ?? null) ? $options['preview_summary'] : null,
+            'preview_error' => is_string($options['preview_error'] ?? null) ? $options['preview_error'] : null,
+            'preview_no_recent_heartbeat' => ($options['preview_state'] ?? null) === 'building'
+                && ($options['preview_heartbeat_at'] ?? null) !== null
+                && Carbon::parse($options['preview_heartbeat_at'])->lessThan(now()->subSeconds(max(1, (int) config('smart-import.recovery.stale_after_seconds', 900)))),
+            'stage_summary' => [
+                'valid' => (int) $session->stage_valid,
+                'invalid' => (int) $session->stage_invalid,
+                'warnings' => (int) $session->stage_warning,
+                'excluded' => (int) $session->rows()->where('execution_status', 'excluded')->count(),
+            ],
             'page' => $page,
             'per_page' => $perPage,
             'total' => $total,
@@ -272,10 +633,15 @@ final class ImportPreviewService
         ];
     }
 
-    /** Confirm exactly the previewed mapping/staging revision and freeze it for execution. */
-    public function confirm(string $sessionId, Authenticatable $actor): ImportSession
+    /** Confirm exactly the reviewed staging revision and freeze its eligible rows for execution. */
+    public function confirm(
+        string $sessionId,
+        Authenticatable $actor,
+        int $expectedStagingRevision,
+        bool $excludeInvalidRows = false,
+    ): ImportSession
     {
-        DB::transaction(function () use ($sessionId, $actor): void {
+        DB::transaction(function () use ($sessionId, $actor, $expectedStagingRevision, $excludeInvalidRows): void {
             $session = $this->authorization
                 ->applyActorScope(ImportSession::query()->lockForUpdate(), $actor)
                 ->whereKey($sessionId)
@@ -283,17 +649,49 @@ final class ImportPreviewService
 
             $this->authorization->authorize('view', $actor, $session);
             $this->authorization->authorize('queue', $actor, $session);
+            $definition = $this->definition($session);
+            $this->authorization->authorize('useImporter', $actor, $definition);
+
+            if ($session->staging_revision !== $expectedStagingRevision) {
+                throw new DomainException('This import changed after you reviewed it. Refresh the review before confirming.');
+            }
+
+            $options = $session->options ?? [];
+
+            if (($options['preview_state'] ?? null) !== 'ready'
+                || ($options['preview_revision'] ?? null) !== $session->staging_revision) {
+                throw new DomainException('Generate a complete preview for the current import revision before confirming.');
+            }
+
             $this->executionDispatcher->assertQueueCanRunAsynchronously();
 
             if ($session->status !== ImportStatus::ReviewReady) {
                 throw new DomainException('Only a review-ready import can be confirmed.');
             }
 
-            $this->definition($session);
             $total = $session->rows()->count();
 
             if ($total === 0) {
                 throw new DomainException('An import with no staged rows cannot be confirmed.');
+            }
+
+            $invalidCount = $session->rows()->where('validation_status', 'invalid')->count();
+
+            if ($excludeInvalidRows && ! $definition->writePolicy()->allowInvalidRowExclusion) {
+                throw new DomainException('This importer does not allow invalid rows to be excluded at confirmation.');
+            }
+
+            if ($invalidCount > 0 && ! $excludeInvalidRows) {
+                throw new DomainException(sprintf(
+                    '%d invalid staged row(s) must be corrected before confirmation, or explicitly excluded when the importer allows it.',
+                    $invalidCount,
+                ));
+            }
+
+            $executionTotal = $total - ($excludeInvalidRows ? $invalidCount : 0);
+
+            if ($executionTotal < 1) {
+                throw new DomainException('No valid staged rows remain to import after excluding invalid rows.');
             }
 
             $invalidPreview = false;
@@ -317,18 +715,31 @@ final class ImportPreviewService
                 throw new DomainException('Generate a complete preview for the current import revision before confirming.');
             }
 
+            if ($excludeInvalidRows && $invalidCount > 0) {
+                $session->rows()
+                    ->where('validation_status', 'invalid')
+                    ->where('execution_status', 'pending')
+                    ->update(['execution_status' => 'excluded', 'updated_at' => now()]);
+            }
+
             $attemptId = $session->current_attempt + 1;
             $queuedAt = now();
             $attempts = $session->attempt_history ?? [];
             $attempts[] = [
                 'attempt' => $attemptId,
                 'confirmed_revision' => $session->staging_revision,
-                'execution_total' => $total,
+                'execution_total' => $executionTotal,
+                'excluded_invalid_count' => $excludeInvalidRows ? $invalidCount : 0,
                 'queued_at' => $queuedAt->toISOString(),
             ];
             $session->forceFill([
+                'options' => array_merge($session->options ?? [], [
+                    'exclude_invalid_rows' => $excludeInvalidRows,
+                    'excluded_invalid_row_count' => $excludeInvalidRows ? $invalidCount : 0,
+                    'eligible_row_count' => $executionTotal,
+                ]),
                 'confirmed_revision' => $session->staging_revision,
-                'execution_total' => $total,
+                'execution_total' => $executionTotal,
                 'current_attempt' => $attemptId,
                 'recovery_count' => 0,
                 'attempt_history' => $attempts,
@@ -337,6 +748,12 @@ final class ImportPreviewService
             ]);
             $session->transitionTo(ImportStatus::Queued);
             $session->save();
+            $this->audit->record($session, 'import.confirmed', $actor, 'operator_confirmed', [
+                'confirmed_revision' => (int) $session->confirmed_revision,
+                'attempt_id' => (int) $session->current_attempt,
+                'execution_total' => (int) $session->execution_total,
+                'excluded_count' => (int) ($options['excluded_invalid_row_count'] ?? 0),
+            ]);
 
             $session->getConnection()->afterCommit(fn () => $this->executionDispatcher->dispatchConfirmed(
                 (string) $session->getKey(),
@@ -441,7 +858,7 @@ final class ImportPreviewService
                 continue;
             }
 
-            foreach (array_keys($row->normalized_values ?? []) as $fieldName) {
+            foreach (array_keys($this->payloadCodec->reveal($row->normalized_values)) as $fieldName) {
                 $columns[] = $target->qualifyColumn($fieldName);
             }
         }
@@ -485,7 +902,7 @@ final class ImportPreviewService
             $beforeExists = $target !== null;
             $before = $target?->getRawOriginal($fieldName);
 
-            if ($target !== null && $this->sameValue($before, $after)) {
+            if ($target !== null && $this->valueComparator->sameForField($field, $target, $before, $after)) {
                 continue;
             }
 
@@ -513,19 +930,6 @@ final class ImportPreviewService
         return $changes;
     }
 
-    private function sameValue(mixed $before, mixed $after): bool
-    {
-        if ($before === null || $after === null) {
-            return $before === $after;
-        }
-
-        if (is_scalar($before) && is_scalar($after)) {
-            return (string) $before === (string) $after;
-        }
-
-        return $before === $after;
-    }
-
     private function encodeValue(mixed $value): string
     {
         try {
@@ -542,18 +946,20 @@ final class ImportPreviewService
         ImportSession $session,
         int $mappingRevision,
         int $stagingRevision,
+        string $generationId,
         array $previews,
     ): void {
         if ($previews === []) {
             return;
         }
 
-        DB::transaction(function () use ($session, $mappingRevision, $stagingRevision, $previews): void {
+        DB::transaction(function () use ($session, $mappingRevision, $stagingRevision, $generationId, $previews): void {
             $current = ImportSession::query()->lockForUpdate()->findOrFail($session->getKey());
 
             if ($current->status !== ImportStatus::ReviewReady
                 || $current->mapping_revision !== $mappingRevision
-                || $current->staging_revision !== $stagingRevision) {
+                || $current->staging_revision !== $stagingRevision
+                || ! $this->isCurrentGeneration($current, $mappingRevision, $stagingRevision, $generationId)) {
                 throw new DomainException('The staged import changed while its preview was being generated.');
             }
 
@@ -573,18 +979,221 @@ final class ImportPreviewService
             }
 
             ImportRow::query()->upsert($records, ['id'], ['preview', 'updated_at']);
+            $options = $current->options ?? [];
+            $options['preview_processed'] = $current->rows()->whereNotNull('preview')->count();
+            $options['preview_heartbeat_at'] = now()->toIso8601String();
+            $current->forceFill([
+                'options' => $options,
+                'heartbeat_at' => now(),
+            ])->save();
         }, 3);
     }
 
-    private function assertRevisionCurrent(ImportSession $session, int $mappingRevision, int $stagingRevision): void
+    private function assertRevisionCurrent(ImportSession $session, int $mappingRevision, int $stagingRevision, string $generationId): void
     {
         $current = ImportSession::query()->findOrFail($session->getKey());
 
         if ($current->status !== ImportStatus::ReviewReady
             || $current->mapping_revision !== $mappingRevision
-            || $current->staging_revision !== $stagingRevision) {
+            || $current->staging_revision !== $stagingRevision
+            || ! $this->isCurrentGeneration($current, $mappingRevision, $stagingRevision, $generationId)) {
             throw new DomainException('The staged import changed while its preview was being generated.');
         }
+    }
+
+    private function markPreviewBuilding(
+        ImportSession $session,
+        int $mappingRevision,
+        int $stagingRevision,
+        int $total,
+        string $generationId,
+    ): void
+    {
+        DB::transaction(function () use ($session, $mappingRevision, $stagingRevision, $total, $generationId): void {
+            $current = ImportSession::query()->lockForUpdate()->findOrFail($session->getKey());
+
+            if ($current->status !== ImportStatus::ReviewReady
+                || $current->mapping_revision !== $mappingRevision
+                || $current->staging_revision !== $stagingRevision) {
+                throw new DomainException('The staged import changed before its preview could be generated.');
+            }
+
+            $this->writePreviewBuildingState($current, $mappingRevision, $stagingRevision, $total, $generationId);
+        }, 3);
+    }
+
+    private function writePreviewBuildingState(
+        ImportSession $session,
+        int $mappingRevision,
+        int $stagingRevision,
+        int $total,
+        string $generationId,
+    ): void {
+        $session->rows()->update(['preview' => null]);
+        $options = $session->options ?? [];
+        $session->forceFill([
+            'options' => array_merge($options, [
+                'preview_state' => 'building',
+                'preview_revision' => $stagingRevision,
+                'preview_mapping_revision' => $mappingRevision,
+                'preview_generation_id' => $generationId,
+                'preview_recovery_count' => 0,
+                'preview_processed' => 0,
+                'preview_total' => $total,
+                'preview_summary' => null,
+                'preview_error' => null,
+                'preview_heartbeat_at' => now()->toIso8601String(),
+            ]),
+            'heartbeat_at' => now(),
+        ])->save();
+    }
+
+    private function restartPreviewRun(
+        ImportSession $session,
+        int $mappingRevision,
+        int $stagingRevision,
+        string $generationId,
+        int $total,
+    ): void {
+        DB::transaction(function () use ($session, $mappingRevision, $stagingRevision, $generationId, $total): void {
+            $current = ImportSession::query()->lockForUpdate()->findOrFail($session->getKey());
+
+            if (! $this->isCurrentGeneration($current, $mappingRevision, $stagingRevision, $generationId)) {
+                throw new DomainException('The preview generation was replaced before processing could start.');
+            }
+
+            $options = $current->options ?? [];
+            $current->rows()->update(['preview' => null]);
+            $options['preview_processed'] = 0;
+            $options['preview_total'] = $total;
+            $options['preview_summary'] = null;
+            $options['preview_error'] = null;
+            $options['preview_heartbeat_at'] = now()->toIso8601String();
+            $current->forceFill(['options' => $options, 'heartbeat_at' => now()])->save();
+        }, 3);
+    }
+
+    private function dispatchPreview(string $sessionId, int $mappingRevision, int $stagingRevision, string $generationId): void
+    {
+        $job = new GenerateImportPreviewJob($sessionId, $mappingRevision, $stagingRevision, $generationId);
+        $queue = config('smart-import.queue.name');
+        $connection = config('smart-import.queue.connection');
+
+        if (is_string($queue) && $queue !== '') {
+            $job->onQueue($queue);
+        }
+
+        if (is_string($connection) && $connection !== '') {
+            $job->onConnection($connection);
+        }
+
+        $job->afterCommit();
+        dispatch($job);
+    }
+
+    private function failPreview(string $sessionId, int $mappingRevision, int $stagingRevision, string $generationId): void
+    {
+        DB::transaction(function () use ($sessionId, $mappingRevision, $stagingRevision, $generationId): void {
+            $session = ImportSession::query()->lockForUpdate()->find($sessionId);
+
+            if (! $this->isCurrentGeneration($session, $mappingRevision, $stagingRevision, $generationId)) {
+                return;
+            }
+
+            $options = $session->options ?? [];
+            $options['preview_state'] = 'failed';
+            $options['preview_error'] = 'The change preview could not be completed. Retry preview generation.';
+            $options['preview_heartbeat_at'] = now()->toIso8601String();
+            $session->forceFill(['options' => $options, 'heartbeat_at' => now()])->save();
+        }, 3);
+    }
+
+    private function failUnavailablePreviewQueue(string $sessionId): void
+    {
+        DB::transaction(function () use ($sessionId): void {
+            $session = ImportSession::query()->lockForUpdate()->find($sessionId);
+
+            if ($session === null || $session->status !== ImportStatus::ReviewReady) {
+                return;
+            }
+
+            $options = $session->options ?? [];
+
+            if (($options['preview_state'] ?? null) !== 'building') {
+                return;
+            }
+
+            $options['preview_state'] = 'failed';
+            $options['preview_error'] = 'The configured queue cannot run preview recovery. Check the queue connection and start its worker.';
+            $options['preview_heartbeat_at'] = now()->toIso8601String();
+            $session->forceFill(['options' => $options, 'heartbeat_at' => now()])->save();
+        }, 3);
+    }
+
+    private function isCurrentGeneration(
+        ?ImportSession $session,
+        int $mappingRevision,
+        int $stagingRevision,
+        string $generationId,
+    ): bool {
+        if (! $session instanceof ImportSession
+            || $session->status !== ImportStatus::ReviewReady
+            || $session->mapping_revision !== $mappingRevision
+            || $session->staging_revision !== $stagingRevision) {
+            return false;
+        }
+
+        $options = $session->options ?? [];
+
+        return ($options['preview_state'] ?? null) === 'building'
+            && ($options['preview_revision'] ?? null) === $stagingRevision
+            && ($options['preview_mapping_revision'] ?? null) === $mappingRevision
+            && hash_equals((string) ($options['preview_generation_id'] ?? ''), $generationId);
+    }
+
+    /** @param array{staging_revision: int, total: int, create: int, update: int, skip: int, fail: int} $summary */
+    private function markPreviewReady(
+        ImportSession $session,
+        int $mappingRevision,
+        int $stagingRevision,
+        string $generationId,
+        array $summary,
+    ): void {
+        DB::transaction(function () use ($session, $mappingRevision, $stagingRevision, $generationId, $summary): void {
+            $current = ImportSession::query()->lockForUpdate()->findOrFail($session->getKey());
+
+            if ($current->status !== ImportStatus::ReviewReady
+                || $current->mapping_revision !== $mappingRevision
+                || $current->staging_revision !== $stagingRevision
+                || ! $this->isCurrentGeneration($current, $mappingRevision, $stagingRevision, $generationId)) {
+                throw new DomainException('The staged import changed while its preview was being generated.');
+            }
+
+            $options = $current->options ?? [];
+            $current->forceFill([
+                'options' => array_merge($options, [
+                    'preview_state' => 'ready',
+                    'preview_revision' => $stagingRevision,
+                    'preview_mapping_revision' => $mappingRevision,
+                    'preview_generation_id' => $generationId,
+                    'preview_processed' => $summary['total'],
+                    'preview_total' => $summary['total'],
+                    'preview_summary' => $summary,
+                    'preview_error' => null,
+                    'preview_heartbeat_at' => now()->toIso8601String(),
+                ]),
+                'heartbeat_at' => now(),
+            ]);
+            $current->save();
+            $this->audit->record($current, 'preview.generated', reasonCode: 'preview_ready', metadata: [
+                'staging_revision' => $stagingRevision,
+                'total' => $summary['total'],
+                'create' => $summary['create'],
+                'update' => $summary['update'],
+                'skip' => $summary['skip'],
+                'fail' => $summary['fail'],
+            ]);
+        }, 3);
     }
 
     /** @return array<string, bool> */
@@ -678,6 +1287,29 @@ final class ImportPreviewService
             'target_match_ambiguous' => 'This key matches more than one existing target record.',
             default => 'This field did not pass the configured validation rules.',
         };
+    }
+
+    private function safeReviewValue(mixed $value): string|int|float|bool|null
+    {
+        if (is_string($value)) {
+            return mb_strlen($value, 'UTF-8') > 500
+                ? mb_substr($value, 0, 500, 'UTF-8').'…'
+                : $value;
+        }
+
+        if ($value === null || is_scalar($value)) {
+            return $value;
+        }
+
+        try {
+            $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return '[value unavailable]';
+        }
+
+        return mb_strlen($encoded, 'UTF-8') > 500
+            ? mb_substr($encoded, 0, 500, 'UTF-8').'…'
+            : $encoded;
     }
 
     /** @param array<string, bool> $sensitiveAccess

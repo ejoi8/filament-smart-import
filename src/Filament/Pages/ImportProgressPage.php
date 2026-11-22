@@ -108,6 +108,10 @@ final class ImportProgressPage extends ImportHubPage
             Action::make('backToInbox')
                 ->label('Back to inbox')
                 ->url(ImportInboxPage::getUrl()),
+            Action::make('reviewImport')
+                ->label('Review import')
+                ->url(ImportReviewPage::getUrl(['session' => $this->sessionId]))
+                ->visible(fn (): bool => ($this->progress['status'] ?? null) === ImportStatus::ReviewReady->value),
         ];
     }
 }

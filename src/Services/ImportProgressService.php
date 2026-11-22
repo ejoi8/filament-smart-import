@@ -33,6 +33,15 @@ final class ImportProgressService
         $startedAt = $session->started_at;
         $finishedAt = $session->finished_at;
         $lastActivity = $this->lastActivity($session);
+        $heartbeatThreshold = max(1, min(604800, (int) config('smart-import.recovery.stale_after_seconds', 900)));
+        $noRecentHeartbeat = in_array($status, [
+            ImportStatus::Staging,
+            ImportStatus::Queued,
+            ImportStatus::Importing,
+            ImportStatus::Cancelling,
+        ], true)
+            && $lastActivity !== null
+            && $lastActivity->getTimestamp() < now()->subSeconds($heartbeatThreshold)->getTimestamp();
         $durationSeconds = $startedAt === null
             ? null
             : max(0, ($finishedAt ?? now())->getTimestamp() - $startedAt->getTimestamp());
@@ -78,6 +87,7 @@ final class ImportProgressService
                 'last_activity' => $lastActivity?->toIso8601String(),
                 'duration_seconds' => $durationSeconds,
             ],
+            'no_recent_heartbeat' => $noRecentHeartbeat,
             'recent_errors' => $recentErrors,
         ];
     }

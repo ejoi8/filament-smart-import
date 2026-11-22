@@ -13,6 +13,96 @@
             </dl>
         </x-filament::section>
 
+        @if ($isCsv)
+            <x-filament::section heading="CSV reading settings">
+                <p class="mb-4 text-sm text-gray-600 dark:text-gray-400">These settings apply to the sample and the background staging worker.</p>
+                <div class="grid gap-6 md:grid-cols-2">
+                    <label class="block space-y-2">
+                        <span class="text-sm font-medium text-gray-950 dark:text-white">Delimiter</span>
+                        <x-filament::input.wrapper>
+                            <x-filament::input.select wire:model.live="csvDelimiterValue" aria-label="CSV delimiter">
+                                <option value="auto">Detect automatically</option>
+                                @foreach (config('smart-import.reading.csv_delimiters', []) as $delimiter => $label)
+                                    <option value="{{ $delimiter }}">{{ $label }}</option>
+                                @endforeach
+                            </x-filament::input.select>
+                        </x-filament::input.wrapper>
+                    </label>
+                    <label class="block space-y-2">
+                        <span class="text-sm font-medium text-gray-950 dark:text-white">Text encoding</span>
+                        <x-filament::input.wrapper>
+                            <x-filament::input.select wire:model.live="csvEncodingValue" aria-label="CSV text encoding">
+                                <option value="guess">Detect automatically</option>
+                                @foreach (config('smart-import.reading.csv_encodings', []) as $encoding)
+                                    <option value="{{ $encoding }}">{{ $encoding }}</option>
+                                @endforeach
+                            </x-filament::input.select>
+                        </x-filament::input.wrapper>
+                    </label>
+                </div>
+            </x-filament::section>
+        @endif
+
+        @if ($importerOptionDefinitions !== [])
+            <x-filament::section heading="Importer settings">
+                <p class="mb-4 text-sm text-gray-600 dark:text-gray-400">These choices are defined and checked by this importer. They are saved with the staged revision.</p>
+                <div class="grid gap-6 md:grid-cols-2">
+                    @foreach ($importerOptionDefinitions as $key => $option)
+                        <label class="block space-y-2">
+                            <span class="text-sm font-medium text-gray-950 dark:text-white">{{ $option['label'] }}</span>
+                            <x-filament::input.wrapper>
+                                <x-filament::input.select wire:model.live="importerOptions.{{ $key }}" aria-label="{{ $option['label'] }}">
+                                    @foreach ($option['choices'] as $value => $label)
+                                        <option value="{{ $value }}">{{ $label }}</option>
+                                    @endforeach
+                                </x-filament::input.select>
+                            </x-filament::input.wrapper>
+                        </label>
+                    @endforeach
+                </div>
+            </x-filament::section>
+        @endif
+
+        <x-filament::section heading="Reusable mapping presets">
+            <p class="mb-4 text-sm text-gray-600 dark:text-gray-400">Presets are tied to this importer, worksheet, header, and CSV settings. Applying one replaces the current column choices, so review them before staging.</p>
+            <div class="grid gap-6 md:grid-cols-2">
+                <label class="block space-y-2">
+                    <span class="text-sm font-medium text-gray-950 dark:text-white">Saved preset</span>
+                    <x-filament::input.wrapper>
+                        <x-filament::input.select wire:model.live="selectedPresetId" aria-label="Saved mapping preset">
+                            @foreach ($presetSelectOptions as $id => $label)
+                                <option value="{{ $id }}">{{ $label }}</option>
+                            @endforeach
+                        </x-filament::input.select>
+                    </x-filament::input.wrapper>
+                </label>
+                <div class="flex items-end">
+                    <x-filament::button type="button" color="gray" wire:click="applySelectedPreset" :disabled="! ($presetCompatibility['compatible'] ?? false)">
+                        Apply preset
+                    </x-filament::button>
+                </div>
+                <label class="block space-y-2">
+                    <span class="text-sm font-medium text-gray-950 dark:text-white">Save current mapping as</span>
+                    <x-filament::input.wrapper>
+                        <x-filament::input wire:model="presetName" maxlength="120" aria-label="Mapping preset name" />
+                    </x-filament::input.wrapper>
+                </label>
+                <div class="flex items-end">
+                    <x-filament::button type="button" color="gray" wire:click="saveMappingPreset">
+                        Save mapping preset
+                    </x-filament::button>
+                </div>
+            </div>
+            @if ($presetMessage !== '')
+                <p class="mt-4 text-sm text-gray-600 dark:text-gray-400" role="status">{{ $presetMessage }}</p>
+            @endif
+        </x-filament::section>
+
+        <x-filament::section heading="Importer processing rules">
+            <p class="text-sm text-gray-700 dark:text-gray-300">{{ $processingSummary }}</p>
+            <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">These rules are fixed by the registered importer. The form cannot change its write mode, matching key, or blank handling.</p>
+        </x-filament::section>
+
         <form wire:submit="startStaging" class="space-y-6">
             <x-filament::section heading="Choose a worksheet and header">
                 <div class="grid gap-6 md:grid-cols-2">
@@ -35,13 +125,40 @@
                                 @foreach ($previewRows as $row)
                                     <option value="{{ $row['row_number'] }}">Row {{ $row['row_number'] }}</option>
                                 @endforeach
+                                <option value="custom">Another row…</option>
                             </x-filament::input.select>
                         </x-filament::input.wrapper>
                     </label>
+
+                    @if ($headerRowValue === 'custom')
+                        <label class="block space-y-2">
+                            <span class="text-sm font-medium text-gray-950 dark:text-white">Header row number</span>
+                            <x-filament::input.wrapper>
+                                <x-filament::input type="number" min="1" max="{{ $sheetRowCount }}" wire:model.live.debounce.500ms="customHeaderRowValue" aria-label="Header row number" />
+                            </x-filament::input.wrapper>
+                        </label>
+                    @endif
                 </div>
 
                 @if ($previewMessage !== '')
                     <p class="mt-4 text-sm text-warning-700 dark:text-warning-300" role="status">{{ $previewMessage }}</p>
+                @endif
+
+                @if ($headerSuggestion !== null && (string) $headerSuggestion['row_number'] !== $headerRowValue)
+                    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-primary-50 p-3 text-sm text-primary-800 dark:bg-primary-400/10 dark:text-primary-200" role="status">
+                        <p>
+                            Likely header: row {{ $headerSuggestion['row_number'] }}
+                            ({{ count($headerSuggestion['matched_fields']) }} importer fields matched).
+                            Review the suggestion before staging.
+                        </p>
+                        <x-filament::button type="button" color="gray" wire:click="useDetectedHeaderRow">
+                            Use detected header
+                        </x-filament::button>
+                    </div>
+                @elseif ($headerSuggestion === null)
+                    <p class="mt-4 text-sm text-gray-600 dark:text-gray-400" role="status">
+                        No confident header was found in this sample. Choose a header row or select “No header row”.
+                    </p>
                 @endif
             </x-filament::section>
 

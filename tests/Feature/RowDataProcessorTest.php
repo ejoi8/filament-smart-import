@@ -87,6 +87,26 @@ class RowDataProcessorTest extends TestCase
     }
 
     #[Test]
+    public function importer_owned_laravel_rule_callables_apply_business_validation(): void
+    {
+        $definition = $this->definition([
+            new ImportField('status', 'Status', rules: [static function (string $attribute, mixed $value, \Closure $fail): void {
+                if ($value !== 'approved') {
+                    $fail('The status is not approved for import.');
+                }
+            }]),
+        ]);
+
+        $accepted = $this->processor()->process($definition, [1 => 'approved'], [1 => 'status'], 2);
+        $rejected = $this->processor()->process($definition, [1 => 'pending'], [1 => 'status'], 3);
+
+        $this->assertTrue($accepted['valid']);
+        $this->assertNotSame('', $rejected['errors'][0]['code']);
+        $this->assertSame('The status is not approved for import.', $rejected['errors'][0]['safe_message']);
+        $this->assertSame(3, $rejected['errors'][0]['source_row']);
+    }
+
+    #[Test]
     public function required_fields_are_validated_even_when_unmapped_and_missing_cells_stay_absent(): void
     {
         $definition = $this->definition([

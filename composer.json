@@ -38,6 +38,9 @@
             "SmartImport\\Tests\\": "tests/"
         }
     },
+    "scripts": {
+        "test": "@php vendor/bin/phpunit"
+    },
     "extra": {
         "laravel": {
             "providers": [
