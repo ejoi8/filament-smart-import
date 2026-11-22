@@ -12,6 +12,26 @@ A reusable Laravel import engine with an optional Filament 5 Import Hub. Import 
 - Filament 5 is optional and required only for the Filament Hub and Resource action.
 - An asynchronous Laravel queue connection for background imports.
 
+## Install from GitHub
+
+The package is not published to Packagist yet, so tell Composer where its GitHub repository is before requiring it. Run these commands from your Laravel application's folder:
+
+```bash
+composer config repositories.filament-smart-import vcs https://github.com/ejoi8/filament-smart-import.git
+composer require smart-import/laravel-smart-import:dev-main
+```
+
+The first command adds the public GitHub repository to your application's `composer.json`. The second installs the package's `main` branch. No GitHub token is needed for this public repository. Because `dev-main` is an in-development branch and not a tagged release, use it in development or staging while the package remains pre-release.
+
+After Composer finishes, publish the package configuration and create its database tables:
+
+```bash
+php artisan vendor:publish --tag=smart-import-config
+php artisan migrate
+```
+
+If you want to use the Filament Import Hub or Resource action, install Filament 5 in the application too, then follow [Enable the Filament Hub](#enable-the-filament-hub). The import engine itself can also be used without Filament.
+
 ## Install for local development
 
 This workspace build is not a tagged release. Extract the package beside your Laravel application, then merge the following repository and package requirement into the application's existing `composer.json`. Adjust the path to match your folders; keep the app's other dependencies:
