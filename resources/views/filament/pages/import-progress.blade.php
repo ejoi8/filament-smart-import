@@ -72,6 +72,11 @@
         </x-filament::section>
 
         <x-filament::section heading="Validation staging">
+            @if (($progress['status'] ?? null) === \SmartImport\Enums\ImportStatus::Staging->value && ($progress['stage']['processed'] ?? 0) === 0)
+                <p class="mb-4 text-sm text-primary-700 dark:text-primary-300" role="status">
+                    Validation staging is queued. If this stays at zero, check that a queue worker is running for the configured connection and the "{{ config('smart-import.queue.name', 'imports') }}" queue.
+                </p>
+            @endif
             <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
                 <div>
                     <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">Status</dt>

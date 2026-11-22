@@ -164,14 +164,28 @@
 
             <x-filament::section heading="Map source columns">
                 <p class="mb-4 text-sm text-gray-600 dark:text-gray-400">
-                    Suggestions are based on the importer field names and aliases. Review each column and choose a field or explicitly ignore it.
+                    Auto-detected mappings are highlighted in green. Suggestions are based on the importer field names and aliases; review each column and choose a field or explicitly ignore it.
                 </p>
+
+                @if ($errors->any())
+                    <p class="mb-4 text-sm text-danger-600 dark:text-danger-400" role="alert">
+                        Some source columns still need a mapping choice. Review the errors below and try again.
+                    </p>
+                @endif
 
                 <div class="space-y-4">
                     @foreach ($headerCells as $sourceColumn => $headerValue)
-                        <label class="grid gap-2 md:grid-cols-2 md:items-center" for="mapping-{{ $sourceColumn }}">
+                        @php($isAutoMapped = isset($suggestedMappings[$sourceColumn]) && ($mapping[$sourceColumn] ?? null) === $suggestedMappings[$sourceColumn])
+                        <label
+                            class="grid gap-2 rounded-lg px-3 py-2 md:grid-cols-2 md:items-center"
+                            @if ($isAutoMapped) style="background-color: rgba(34, 197, 94, 0.10); box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.35);" @endif
+                            for="mapping-{{ $sourceColumn }}"
+                        >
                             <span class="text-sm font-medium text-gray-950 dark:text-white">
                                 Column {{ $sourceColumn }}: {{ $headerValue === null || $headerValue === '' ? 'No header' : $headerValue }}
+                                @if ($isAutoMapped)
+                                    <x-filament::badge color="success" class="ms-2">Auto-detected</x-filament::badge>
+                                @endif
                             </span>
                             <x-filament::input.wrapper>
                                 <x-filament::input.select id="mapping-{{ $sourceColumn }}" wire:model="mapping.{{ $sourceColumn }}" aria-label="Mapping for column {{ $sourceColumn }}">

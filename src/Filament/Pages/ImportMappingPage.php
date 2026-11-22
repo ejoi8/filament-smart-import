@@ -54,6 +54,10 @@ final class ImportMappingPage extends ImportHubPage
     #[Locked]
     public ?array $headerSuggestion = null;
 
+    /** @var array<int, string> */
+    #[Locked]
+    public array $suggestedMappings = [];
+
     #[Locked]
     public array $previewRows = [];
 
@@ -270,7 +274,7 @@ final class ImportMappingPage extends ImportHubPage
         }
 
         try {
-            app(ImportStagingService::class)->start(
+            $stagingSession = app(ImportStagingService::class)->start(
                 (string) $session->getKey(),
                 $this->actor(),
                 $definition->key(),
@@ -297,10 +301,10 @@ final class ImportMappingPage extends ImportHubPage
         Notification::make()
             ->success()
             ->title('Validation staging queued')
-            ->body('The file will be checked and staged for review. Target records have not been changed.')
+            ->body('Progress is saved. If staging stays at zero, check that a queue worker is running for the configured queue.')
             ->send();
 
-        $this->redirect(ImportInboxPage::getUrl(), navigate: true);
+        $this->redirect(ImportProgressPage::getUrl(['session' => $stagingSession->getKey()]), navigate: true);
     }
 
     private function refreshPreview(bool $preserveMapping = false): void
@@ -376,6 +380,11 @@ final class ImportMappingPage extends ImportHubPage
 
         $suggestions = app(ColumnMapper::class)->suggest($definition, $headers);
         $validChoices = ['ignore:'];
+        $this->suggestedMappings = [];
+
+        foreach ($suggestions['mapping'] as $sourceColumn => $suggestedField) {
+            $this->suggestedMappings[$sourceColumn] = 'field:'.$suggestedField;
+        }
 
         foreach ($definition->fields() as $field) {
             $validChoices[] = 'field:'.$field->name;
