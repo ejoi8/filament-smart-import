@@ -206,8 +206,11 @@
                     <p class="mt-4 text-sm text-danger-600 dark:text-danger-400" role="alert">{{ $message }}</p>
                 @enderror
 
-                <div class="mt-6 flex justify-end">
-                    <x-filament::button type="submit" icon="heroicon-o-play">
+                <div class="mt-6 flex items-center justify-end gap-3">
+                    <span wire:loading wire:target="startStaging" class="text-sm text-gray-500 dark:text-gray-400" role="status">
+                        Starting validation staging…
+                    </span>
+                    <x-filament::button type="submit" icon="heroicon-o-play" wire:loading.attr="disabled" wire:target="startStaging">
                         Start validation staging
                     </x-filament::button>
                 </div>

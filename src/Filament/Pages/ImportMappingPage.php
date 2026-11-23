@@ -22,6 +22,7 @@ use SmartImport\Services\SpreadsheetReader;
 use SmartImport\Contracts\ImportOptionProvider;
 use Illuminate\Validation\ValidationException;
 use PhpOffice\PhpSpreadsheet\Reader\Csv;
+use Throwable;
 
 final class ImportMappingPage extends ImportHubPage
 {
@@ -252,7 +253,6 @@ final class ImportMappingPage extends ImportHubPage
     public function startStaging(): void
     {
         [$session, $definition] = $this->authorizedContext();
-        $headerRow = $this->selectedHeaderRow();
         $mapping = [];
 
         foreach (array_keys($this->headerCells) as $sourceColumn) {
@@ -279,7 +279,7 @@ final class ImportMappingPage extends ImportHubPage
                 $this->actor(),
                 $definition->key(),
                 $this->sheetIndex,
-                $headerRow,
+                $this->selectedHeaderRow(),
                 $mapping,
                 [
                     ...$this->selectedReaderOptions(),
@@ -293,6 +293,15 @@ final class ImportMappingPage extends ImportHubPage
                 ->danger()
                 ->title('Staging could not be started')
                 ->body($exception->getMessage())
+                ->send();
+
+            return;
+        } catch (Throwable $exception) {
+            report($exception);
+            Notification::make()
+                ->danger()
+                ->title('Staging could not be started')
+                ->body('The queue job could not be dispatched. Check the application log and queue configuration.')
                 ->send();
 
             return;
