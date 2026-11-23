@@ -25,13 +25,21 @@ class AdminPanelProvider extends PanelProvider
 }
 ```
 
-If the panel uses a custom Filament theme, add the package views to that theme's Tailwind sources so the Hub's utility classes are compiled:
+The Hub ships its own compiled CSS asset, so a custom Filament theme is not required. After registering the plugin or updating the package, publish Filament assets:
+
+```bash
+php artisan filament:assets
+```
+
+`filament:upgrade`, which most applications already run from Composer's `post-autoload-dump` hook, calls the same asset command. The stylesheet is published to `public/css/smart-import/smart-import.css`.
+
+If you want to retheme or override Hub styling through your own custom Filament theme, add the package views to that theme's Tailwind sources and rebuild the theme:
 
 ```css
 @source '../../../../vendor/smart-import/laravel-smart-import/resources/views/**/*';
 ```
 
-Adjust the relative path for the theme file location, then rebuild the theme assets (for example, `npm run build`). Without this, the Hub pages still render, but some layout utilities are missing and the UI appears unstyled. Rebuild the theme after updating the package if its view classes change.
+Adjust the relative path for the theme file location. Rebuild the theme after updating the package if its view classes change.
 
 In `config/smart-import.php`, register only the panels that should expose the Hub and map each panel to an application Gate ability:
 

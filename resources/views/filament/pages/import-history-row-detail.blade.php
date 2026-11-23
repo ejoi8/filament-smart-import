@@ -1,4 +1,4 @@
-<x-filament-panels::page>
+<x-filament-panels::page class="smart-import">
     <div class="space-y-6">
         <x-filament::section heading="Row outcome">
             <dl class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">

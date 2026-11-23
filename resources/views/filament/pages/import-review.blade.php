@@ -1,4 +1,4 @@
-<x-filament-panels::page>
+<x-filament-panels::page class="smart-import">
     @php($pollSeconds = max(1, min(60, (int) config('smart-import.progress.polling_interval_seconds', 2))))
 
     @if (($review['preview_state'] ?? null) === 'building')

@@ -4,6 +4,8 @@ namespace SmartImport\Filament;
 
 use Filament\Contracts\Plugin;
 use Filament\Panel;
+use Filament\Support\Assets\Css;
+use Filament\Support\Facades\FilamentAsset;
 use SmartImport\Filament\Pages\ActiveImportsPage;
 use SmartImport\Filament\Pages\ImportInboxPage;
 use SmartImport\Filament\Pages\ImportHistoryDetailPage;
@@ -17,6 +19,8 @@ use SmartImport\Services\HubPanelRegistry;
 
 final class SmartImportPlugin implements Plugin
 {
+    private static bool $assetsRegistered = false;
+
     public static function make(): static
     {
         return new static();
@@ -44,6 +48,14 @@ final class SmartImportPlugin implements Plugin
             ImportHistoryRowsPage::class,
             ImportHistoryRowDetailPage::class,
         ]);
+
+        if (! self::$assetsRegistered) {
+            FilamentAsset::register([
+                Css::make('smart-import', __DIR__.'/../../resources/dist/smart-import.css'),
+            ], 'smart-import');
+
+            self::$assetsRegistered = true;
+        }
     }
 
     public function boot(Panel $panel): void {}

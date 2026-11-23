@@ -50,6 +50,7 @@ Important behavior:
 - Filament 5 only if you want the Hub or Resource action.
 - A lock-capable cache store if you use SFTP discovery.
 - Package tables and imported target models on the same database connection, so row writes and counters can commit atomically.
+- Node.js and the package's npm dependencies are only needed when changing package Blade styles; host applications do not need them.
 
 ## Installation
 
@@ -69,7 +70,7 @@ php artisan vendor:publish --tag=smart-import-config
 php artisan migrate
 ```
 
-`dev-main` is an in-development branch, not a tagged release. Use it in development or staging while the package remains pre-release.
+If you use the Filament Hub, register the plugin and publish its assets as described in [Enable the Filament Hub](#enable-the-filament-hub). `dev-main` is an in-development branch, not a tagged release. Use it in development or staging while the package remains pre-release.
 
 ### Install from a local checkout
 
@@ -161,7 +162,23 @@ public function panel(Panel $panel): Panel
 ],
 ```
 
-Registering a panel without adding it to this map produces no Hub pages for that panel. If the panel uses a custom Filament theme, add the package views to the theme's Tailwind `@source` and rebuild the theme assets; otherwise some Hub layout classes will be missing. See [the Hub guide](docs/filament-hub.md) for the exact source line, mapping, review, progress, and history details.
+After registering the plugin, publish Filament assets so the Hub stylesheet is available:
+
+```bash
+php artisan filament:assets
+```
+
+The stylesheet is published to `public/css/smart-import/smart-import.css`. The Hub ships its own compiled CSS; a custom theme is not required, and host applications do not need to add package views to their Tailwind sources. Run `filament:assets` after installing or updating the package. `filament:upgrade` and the usual Composer post-autoload hook also publish it.
+
+Registering a panel without adding it to this map produces no Hub pages for that panel.
+
+Custom themes may still include the package views if you want to override Hub styling:
+
+```css
+@source '../../../../vendor/smart-import/laravel-smart-import/resources/views/**/*';
+```
+
+See [the Hub guide](docs/filament-hub.md) for details.
 
 ## Define an importer
 
@@ -368,6 +385,15 @@ composer install
 composer test
 find src tests database config -name '*.php' -print0 | xargs -0 -n1 php -l
 ```
+
+Regenerate the shipped Hub stylesheet after changing package Blade views:
+
+```bash
+npm install
+npm run build:css
+```
+
+Commit the regenerated `resources/dist/smart-import.css` with the view change. Host applications consume that compiled file; they do not compile it themselves.
 
 The package tests use Orchestra Testbench and synthetic models/files. Real queue-worker, concurrency, authorization, retention, and security-boundary tests are included. See the [compatibility record](docs/compatibility.md) for current versions and unverified combinations.
 
