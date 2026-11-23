@@ -161,7 +161,7 @@ public function panel(Panel $panel): Panel
 ],
 ```
 
-Registering a panel without adding it to this map produces no Hub pages for that panel. See [the Hub guide](docs/filament-hub.md) for mapping, review, progress, and history details.
+Registering a panel without adding it to this map produces no Hub pages for that panel. If the panel uses a custom Filament theme, add the package views to the theme's Tailwind `@source` and rebuild the theme assets; otherwise some Hub layout classes will be missing. See [the Hub guide](docs/filament-hub.md) for the exact source line, mapping, review, progress, and history details.
 
 ## Define an importer
 
