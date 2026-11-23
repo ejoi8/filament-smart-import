@@ -166,6 +166,15 @@ final class ImportReviewPage extends ImportHubPage
         $this->refreshReview();
     }
 
+    public function clearRowFilters(): void
+    {
+        $this->validationFilter = '';
+        $this->changeFilter = '';
+        $this->duplicatesOnly = false;
+        $this->rowPage = 1;
+        $this->refreshReview();
+    }
+
     public function updatedEditingField(): void
     {
         if ($this->editingRowId === null || ! array_key_exists($this->editingField, $this->editableFieldOptions($this->editingRowId))) {
