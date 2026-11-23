@@ -258,9 +258,7 @@ final class ImportCoordinator
                 throw new DomainException('An importer cannot be assigned after staging has started.');
             }
 
-            if (in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
-                throw new DomainException('Rejected or archived files cannot be assigned an importer.');
-            }
+            $this->assertImportableIntake($session);
 
             $session->forceFill([
                 'importer_key' => $definition->key(),
@@ -379,9 +377,7 @@ final class ImportCoordinator
 
             $this->authorization->authorize('update', $actor, $session);
 
-            if (in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
-                throw new DomainException('Rejected or archived files cannot be staged.');
-            }
+            $this->assertImportableIntake($session);
 
             if (! in_array($session->status, [null, ImportStatus::Uploaded, ImportStatus::ReviewReady], true)) {
                 throw new DomainException('Only an unstaged or review-ready import can start staging.');
@@ -456,6 +452,18 @@ final class ImportCoordinator
      * Returns true only when this call changed and persisted the state. A false
      * result means the requested state was already current.
      */
+    /** Reject any import action for sources that were rejected or archived. */
+    public function assertImportableIntake(ImportSession $session): void
+    {
+        if ($session->intake_status === IntakeStatus::Archived) {
+            throw new DomainException('This file is archived and cannot be imported. Create a new intake to import it again.');
+        }
+
+        if ($session->intake_status === IntakeStatus::Rejected) {
+            throw new DomainException('This file was rejected and cannot be imported. Create a new intake to import it again.');
+        }
+    }
+
     public function transition(
         string $sessionId,
         ImportStatus|IntakeStatus $next,
@@ -469,9 +477,9 @@ final class ImportCoordinator
 
             $this->authorization->authorize('update', $actor, $session);
 
-            if ($next === ImportStatus::Queued
-                && in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
-                throw new DomainException('Rejected or archived source files cannot be queued for import.');
+            if ($next instanceof ImportStatus
+                && in_array($next, [ImportStatus::Staging, ImportStatus::Queued, ImportStatus::Importing], true)) {
+                $this->assertImportableIntake($session);
             }
 
             $current = $next instanceof ImportStatus ? $session->status : $session->intake_status;

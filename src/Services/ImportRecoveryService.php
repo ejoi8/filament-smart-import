@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Jobs\StageImportJob;
 use SmartImport\Models\ImportSession;
 use Throwable;
@@ -88,6 +89,7 @@ final class ImportRecoveryService
                             });
                     });
             })
+            ->whereNotIn('intake_status', [IntakeStatus::Rejected->value, IntakeStatus::Archived->value])
             ->where(function ($query) use ($cutoff): void {
                 $query->where('heartbeat_at', '<', $cutoff)
                     ->orWhere(function ($query) use ($cutoff): void {
@@ -129,6 +131,10 @@ final class ImportRecoveryService
             $session = ImportSession::query()->lockForUpdate()->find($sessionId);
 
             if ($session === null || ! $this->isStale($session, $cutoff)) {
+                return 'skipped';
+            }
+
+            if (in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
                 return 'skipped';
             }
 

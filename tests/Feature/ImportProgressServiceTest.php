@@ -8,6 +8,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Gate;
 use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
 use SmartImport\Services\ImportCoordinator;
@@ -60,8 +61,9 @@ class ImportProgressServiceTest extends TestCase
 
         $this->assertSame('importing', $progress['status']);
         $this->assertSame(2, $progress['attempt']);
-        $this->assertSame(['percentage' => 25, 'processed' => 1, 'total' => 4, 'remaining' => 3, 'created' => 1, 'updated' => 0, 'skipped' => 0, 'failed' => 0], $progress['execution']);
-        $this->assertSame(['status' => 'importing', 'processed' => 8, 'total' => 8, 'valid' => 7, 'invalid' => 1, 'warnings' => 2], $progress['stage']);
+        $this->assertNull($progress['error_summary']);
+        $this->assertSame(['available' => true, 'percentage' => 25, 'processed' => 1, 'total' => 4, 'remaining' => 3, 'created' => 1, 'updated' => 0, 'skipped' => 0, 'failed' => 0], $progress['execution']);
+        $this->assertSame(['status' => 'completed', 'processed' => 8, 'total' => 8, 'percentage' => 100, 'remaining' => 0, 'valid' => 7, 'invalid' => 1, 'warnings' => 2], $progress['stage']);
         $this->assertSame([[
             'row' => 19,
             'code' => 'validation_failed',
@@ -75,6 +77,88 @@ class ImportProgressServiceTest extends TestCase
         $this->assertSame(100, $updated['execution']['percentage']);
         $this->assertSame(0, $updated['execution']['remaining']);
         $this->assertSame('completed', $updated['status']);
+    }
+
+    #[Test]
+    public function staging_status_distinguishes_running_completed_and_failed_staging(): void
+    {
+        $actor = new GenericUser(['id' => 51]);
+        $session = $this->sessionFor($actor);
+        $session->forceFill([
+            'status' => ImportStatus::Staging,
+            'stage_total' => 10,
+            'stage_processed' => 4,
+            'stage_valid' => 4,
+        ])->save();
+
+        $running = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertFalse($running['execution']['available']);
+        $this->assertSame('staging', $running['stage']['status']);
+        $this->assertSame(40, $running['stage']['percentage']);
+        $this->assertSame(6, $running['stage']['remaining']);
+
+        $session->forceFill([
+            'status' => ImportStatus::Failed,
+            'stage_processed' => 4,
+            'error_summary' => 'Staging stopped before completion.',
+        ])->save();
+
+        $failed = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertSame('failed', $failed['stage']['status']);
+        $this->assertSame('Staging stopped before completion.', $failed['error_summary']);
+
+        $session->forceFill([
+            'status' => ImportStatus::Failed,
+            'stage_processed' => 10,
+            'stage_valid' => 10,
+            'error_summary' => 'Execution failed after staging.',
+            'execution_total' => 10,
+        ])->save();
+
+        $completedStaging = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertSame('completed', $completedStaging['stage']['status']);
+        $this->assertTrue($completedStaging['execution']['available']);
+        $this->assertSame('Execution failed after staging.', $completedStaging['error_summary']);
+
+        $session->forceFill(['status' => ImportStatus::ReviewReady])->save();
+
+        $reviewReady = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertSame('completed', $reviewReady['stage']['status']);
+        $this->assertNull($reviewReady['error_summary']);
+    }
+
+    #[Test]
+    public function blocked_intake_disables_review_and_retry_actions(): void
+    {
+        $actor = new GenericUser(['id' => 51]);
+        $session = $this->sessionFor($actor);
+        $session->forceFill([
+            'status' => ImportStatus::ReviewReady,
+            'stage_total' => 1,
+            'stage_processed' => 1,
+            'intake_status' => IntakeStatus::Archived,
+        ])->save();
+
+        $review = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertSame('archived', $review['intake_status']);
+        $this->assertFalse($review['can_review']);
+        $this->assertFalse($review['can_retry']);
+
+        $session->forceFill([
+            'status' => ImportStatus::Completed,
+            'execution_total' => 1,
+            'processed' => 1,
+            'failed_count' => 1,
+        ])->save();
+
+        $completed = app(ImportProgressService::class)->get((string) $session->getKey(), $actor);
+
+        $this->assertFalse($completed['can_retry']);
     }
 
     #[Test]

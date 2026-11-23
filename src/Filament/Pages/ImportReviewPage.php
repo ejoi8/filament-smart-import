@@ -12,6 +12,7 @@ use Illuminate\Auth\Access\AuthorizationException;
 use InvalidArgumentException;
 use Livewire\Attributes\Locked;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Models\ImportSession;
 use SmartImport\Services\ImportAuthorization;
 use SmartImport\Services\ImportCoordinator;
@@ -311,6 +312,10 @@ final class ImportReviewPage extends ImportHubPage
     private function authorizedSession(): ImportSession
     {
         $session = app(ImportCoordinator::class)->get($this->sessionId, $this->actor());
+
+        if (in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
+            abort(409, 'This file is archived or rejected and cannot be imported.');
+        }
 
         if ($session->status !== ImportStatus::ReviewReady
             || $session->importer_key === null

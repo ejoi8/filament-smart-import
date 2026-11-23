@@ -26,6 +26,7 @@ final class ImportExecutionService
         private ImportValueComparator $valueComparator,
         private ImportExecutionContext $executionContext,
         private ImportPayloadCodec $payloadCodec,
+        private ImportCoordinator $coordinator,
     ) {}
 
     /**
@@ -46,6 +47,7 @@ final class ImportExecutionService
     private function processRowWithinContext(string $sessionId, int $rowId, int $confirmedRevision, ?int $attemptId): array
     {
         $session = ImportSession::query()->findOrFail($sessionId);
+        $this->coordinator->assertImportableIntake($session);
         $definition = $this->definition($session);
         $target = $this->targetModel($definition);
         $connectionName = $session->getConnection()->getName();

@@ -15,6 +15,7 @@ use SmartImport\Contracts\ImportExecutionContext;
 use SmartImport\Data\ImportField;
 use SmartImport\Enums\ImportStatus;
 use SmartImport\Enums\ImportWriteAction;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Jobs\GenerateImportPreviewJob;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
@@ -158,6 +159,18 @@ final class ImportPreviewService
     {
         $session = ImportSession::query()->find($sessionId);
 
+        if (! $session instanceof ImportSession) {
+            return;
+        }
+
+        try {
+            $this->coordinator->assertImportableIntake($session);
+        } catch (DomainException) {
+            $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
+
+            return;
+        }
+
         if (! $this->isCurrentGeneration($session, $mappingRevision, $stagingRevision, $generationId)) {
             return;
         }
@@ -167,6 +180,10 @@ final class ImportPreviewService
                 $session,
                 fn (): array => $this->buildPreview($session, $mappingRevision, $stagingRevision, $generationId),
             );
+        } catch (DomainException $exception) {
+            $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
+
+            return;
         } catch (Throwable $exception) {
             $this->failPreview($sessionId, $mappingRevision, $stagingRevision, $generationId);
 
@@ -196,7 +213,9 @@ final class ImportPreviewService
         $result = DB::transaction(function () use ($sessionId, $cutoff, $maxRecoveries, $dryRun): array {
             $session = ImportSession::query()->lockForUpdate()->find($sessionId);
 
-            if ($session === null || $session->status !== ImportStatus::ReviewReady) {
+            if ($session === null
+                || $session->status !== ImportStatus::ReviewReady
+                || in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
                 return ['outcome' => 'skipped'];
             }
 
@@ -279,6 +298,12 @@ final class ImportPreviewService
      */
     private function buildPreview(ImportSession $session, int $mappingRevision, int $stagingRevision, string $generationId): array
     {
+        $current = $session->fresh();
+
+        if ($current instanceof ImportSession) {
+            $this->coordinator->assertImportableIntake($current);
+        }
+
         if (! $this->isCurrentGeneration($session->fresh(), $mappingRevision, $stagingRevision, $generationId)) {
             throw new DomainException('The staged import changed before its preview worker started.');
         }
@@ -627,7 +652,7 @@ final class ImportPreviewService
                 ])
                 ->values()
                 ->all(),
-            'execution_error' => $lastOutcome['error_code'] === null ? null : [
+            'execution_error' => ($lastOutcome['error_code'] ?? null) === null ? null : [
                 'code' => $lastOutcome['error_code'],
                 'message' => 'The row could not be processed under the confirmed import rules.',
             ],
@@ -636,8 +661,8 @@ final class ImportPreviewService
                 'id' => is_scalar($preview['target_id'] ?? null) ? (string) $preview['target_id'] : $row->resolved_target_id,
             ],
             'outcome_target' => [
-                'type' => $lastOutcome['target_type'],
-                'id' => $lastOutcome['target_id'],
+                'type' => $lastOutcome['target_type'] ?? null,
+                'id' => $lastOutcome['target_id'] ?? null,
             ],
             'attempts' => $outcomes,
             'changes' => $changes,
@@ -660,6 +685,7 @@ final class ImportPreviewService
 
             $this->authorization->authorize('view', $actor, $session);
             $this->authorization->authorize('queue', $actor, $session);
+            $this->coordinator->assertImportableIntake($session);
             $definition = $this->definition($session);
             $this->authorization->authorize('useImporter', $actor, $definition);
 
@@ -779,6 +805,7 @@ final class ImportPreviewService
     private function reviewSession(string $sessionId, Authenticatable $actor, bool $forGeneration = false): ImportSession
     {
         $session = $this->coordinator->get($sessionId, $actor);
+        $this->coordinator->assertImportableIntake($session);
 
         $readableStatuses = [
             ImportStatus::ReviewReady,

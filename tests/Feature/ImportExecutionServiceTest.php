@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use PHPUnit\Framework\Attributes\Test;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Events\ImportFinished;
 use SmartImport\Jobs\ExecuteImportChunkJob;
 use SmartImport\Jobs\StageImportJob;
@@ -736,6 +737,39 @@ class ImportExecutionServiceTest extends TestCase
         } catch (\Illuminate\Auth\Access\AuthorizationException) {
             $this->assertSame(ImportStatus::Queued, $session->fresh()->status);
         }
+    }
+
+    #[Test]
+    public function archived_completed_imports_cannot_retry_failed_rows(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nAda,ada@example.test,ada-token,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $row->forceFill(['execution_status' => 'failed', 'last_error_code' => 'test_failure'])->save();
+        $session->forceFill([
+            'status' => ImportStatus::Completed,
+            'processed' => 1,
+            'failed_count' => 1,
+            'intake_status' => IntakeStatus::Archived,
+        ])->save();
+
+        $this->expectException(\DomainException::class);
+        $this->expectExceptionMessage('archived');
+        $this->app->make(ImportRetryService::class)->retryFailedRows((string) $session->getKey(), $actor);
+    }
+
+    #[Test]
+    public function archived_sessions_cannot_execute_pending_rows(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->confirm($actor, "Name,Email,API token,Department\nAda,ada@example.test,ada-token,Sales\n");
+        $row = $session->rows()->firstOrFail();
+        $session->forceFill(['intake_status' => IntakeStatus::Archived])->save();
+
+        $this->expectException(\DomainException::class);
+        $this->expectExceptionMessage('archived');
+        $this->app->make(ImportExecutionService::class)
+            ->processRow((string) $session->getKey(), $row->id, $session->confirmed_revision);
     }
 
     #[Test]

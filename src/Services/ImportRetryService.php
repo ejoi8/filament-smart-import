@@ -18,6 +18,7 @@ final class ImportRetryService
         private ImporterRegistry $importers,
         private ImportExecutionDispatcher $dispatcher,
         private ImportAuditService $audit,
+        private ImportCoordinator $coordinator,
     ) {}
 
     /** Start a new attempt containing only failed rows from a fully completed attempt. */
@@ -31,6 +32,7 @@ final class ImportRetryService
 
             $this->authorization->authorize('view', $actor, $session);
             $this->authorization->authorize('retry', $actor, $session);
+            $this->coordinator->assertImportableIntake($session);
 
             if ($session->status !== ImportStatus::Completed) {
                 throw new DomainException('Failed rows can be retried only after a completed attempt.');

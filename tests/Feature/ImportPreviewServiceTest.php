@@ -124,6 +124,59 @@ class ImportPreviewServiceTest extends TestCase
     }
 
     #[Test]
+    public function archived_review_ready_imports_cannot_be_previewed_reviewed_or_confirmed(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-TOKEN,Sales\n", $actor);
+        app(FileIntakeService::class)->archive((string) $session->getKey(), $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+
+        $this->assertDomainException(fn () => $service->generate((string) $session->getKey(), $actor), 'archived');
+        $this->assertDomainException(fn () => $service->rows((string) $session->getKey(), $actor, allowMissingPreview: true), 'archived');
+        $this->assertDomainException(
+            fn () => $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision),
+            'archived',
+        );
+    }
+
+    #[Test]
+    public function archived_terminal_imports_keep_read_only_history(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-TOKEN,Sales\n", $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+        $session->forceFill(['status' => ImportStatus::Completed])->save();
+        app(FileIntakeService::class)->archive((string) $session->getKey(), $actor);
+
+        $row = $session->rows()->firstOrFail();
+        $row->forceFill(['execution_status' => 'skipped'])->save();
+        $history = $service->historyRow((string) $session->getKey(), (int) $row->getKey(), $actor);
+
+        $this->assertSame((int) $row->getKey(), $history['id']);
+        $this->assertSame('skipped', $history['execution_status']);
+        $this->assertNull($history['execution_error']);
+        $this->assertNull($history['outcome_target']['type']);
+        $this->assertNull($history['outcome_target']['id']);
+    }
+
+    #[Test]
+    public function rejected_review_ready_imports_cannot_be_previewed_or_confirmed(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-TOKEN,Sales\n", $actor);
+        app(FileIntakeService::class)->reject((string) $session->getKey(), 'Unreadable source', $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+
+        $this->assertDomainException(fn () => $service->generate((string) $session->getKey(), $actor), 'rejected');
+        $this->assertDomainException(fn () => $service->rows((string) $session->getKey(), $actor, allowMissingPreview: true), 'rejected');
+        $this->assertDomainException(
+            fn () => $service->confirm((string) $session->getKey(), $actor, (int) $session->staging_revision),
+            'rejected',
+        );
+    }
+
+    #[Test]
     public function review_rows_preserve_mapped_field_order_and_importer_labels(): void
     {
         $actor = new GenericUser(['id' => 7]);
@@ -758,6 +811,16 @@ class ImportPreviewServiceTest extends TestCase
         $this->assertFalse($first['already_queued']);
         $this->assertTrue($second['already_queued']);
         Queue::assertPushed(GenerateImportPreviewJob::class, 1);
+    }
+
+    private function assertDomainException(callable $callback, string $messageFragment): void
+    {
+        try {
+            $callback();
+            $this->fail('The import action should have been refused for a blocked intake.');
+        } catch (\DomainException $exception) {
+            $this->assertStringContainsString($messageFragment, $exception->getMessage());
+        }
     }
 
     private function stage(

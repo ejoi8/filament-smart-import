@@ -5,6 +5,7 @@ namespace SmartImport\Services;
 use DateTimeInterface;
 use Illuminate\Contracts\Auth\Authenticatable;
 use SmartImport\Enums\ImportStatus;
+use SmartImport\Enums\IntakeStatus;
 use SmartImport\Models\ImportRow;
 use SmartImport\Models\ImportSession;
 
@@ -30,6 +31,10 @@ final class ImportProgressService
         $session = $this->imports->get($sessionId, $actor);
         $status = $session->status;
         $execution = $this->executionProgress($session);
+        $stageTotal = max(0, (int) $session->stage_total);
+        $stageProcessed = min($stageTotal, max(0, (int) $session->stage_processed));
+        $stageStatus = $this->stagingStatus($status, $stageTotal, $stageProcessed);
+        $blockedIntake = in_array($session->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true);
         $startedAt = $session->started_at;
         $finishedAt = $session->finished_at;
         $lastActivity = $this->lastActivity($session);
@@ -67,14 +72,22 @@ final class ImportProgressService
             'status' => $status?->value,
             'can_cancel' => in_array($status, [ImportStatus::Queued, ImportStatus::Importing], true)
                 && $this->authorization->allows('cancel', $actor, $session),
-            'can_retry' => $status === ImportStatus::Completed
+            'can_retry' => ! $blockedIntake
+                && $status === ImportStatus::Completed
                 && (int) $session->failed_count > 0
                 && $this->authorization->allows('retry', $actor, $session),
+            'can_review' => ! $blockedIntake && $status === ImportStatus::ReviewReady,
+            'intake_status' => $session->intake_status?->value,
             'attempt' => (int) $session->current_attempt,
+            'error_summary' => $status === ImportStatus::Failed ? $session->error_summary : null,
             'stage' => [
-                'status' => $status?->value,
-                'processed' => (int) $session->stage_processed,
-                'total' => (int) $session->stage_total,
+                'status' => $stageStatus,
+                'processed' => $stageProcessed,
+                'total' => $stageTotal,
+                'percentage' => $stageTotal === 0
+                    ? ($stageStatus === 'completed' ? 100 : 0)
+                    : (int) floor(($stageProcessed / $stageTotal) * 100),
+                'remaining' => max(0, $stageTotal - $stageProcessed),
                 'valid' => (int) $session->stage_valid,
                 'invalid' => (int) $session->stage_invalid,
                 'warnings' => (int) $session->stage_warning,
@@ -107,6 +120,7 @@ final class ImportProgressService
                 ImportStatus::Importing->value,
                 ImportStatus::Cancelling->value,
             ])
+            ->whereNotIn('intake_status', [IntakeStatus::Rejected->value, IntakeStatus::Archived->value])
             ->orderByDesc('updated_at')
             ->get();
 
@@ -139,13 +153,14 @@ final class ImportProgressService
             ->all();
     }
 
-    /** @return array{percentage: int, processed: int, total: int, remaining: int, created: int, updated: int, skipped: int, failed: int} */
+    /** @return array{available: bool, percentage: int, processed: int, total: int, remaining: int, created: int, updated: int, skipped: int, failed: int} */
     private function executionProgress(ImportSession $session): array
     {
         $total = max(0, (int) $session->execution_total);
         $processed = min($total, max(0, (int) $session->processed));
 
         return [
+            'available' => $total > 0,
             'percentage' => $total === 0
                 ? ($session->status === ImportStatus::Completed ? 100 : 0)
                 : (int) floor(($processed / $total) * 100),
@@ -157,6 +172,24 @@ final class ImportProgressService
             'skipped' => (int) $session->skipped_count,
             'failed' => (int) $session->failed_count,
         ];
+    }
+
+    private function stagingStatus(?ImportStatus $status, int $total, int $processed): string
+    {
+        return match (true) {
+            $status === ImportStatus::Staging => 'staging',
+            in_array($status, [
+                ImportStatus::ReviewReady,
+                ImportStatus::Queued,
+                ImportStatus::Importing,
+                ImportStatus::Cancelling,
+                ImportStatus::Completed,
+                ImportStatus::Cancelled,
+            ], true) => 'completed',
+            $status === ImportStatus::Failed && $total > 0 && $processed >= $total => 'completed',
+            $status === ImportStatus::Failed => 'failed',
+            default => 'pending',
+        };
     }
 
     private function lastActivity(ImportSession $session): ?DateTimeInterface

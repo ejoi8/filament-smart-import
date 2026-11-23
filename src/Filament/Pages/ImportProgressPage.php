@@ -111,7 +111,16 @@ final class ImportProgressPage extends ImportHubPage
             Action::make('reviewImport')
                 ->label('Review import')
                 ->url(ImportReviewPage::getUrl(['session' => $this->sessionId]))
-                ->visible(fn (): bool => ($this->progress['status'] ?? null) === ImportStatus::ReviewReady->value),
+                ->visible(fn (): bool => $this->progress['can_review'] ?? false),
+            Action::make('viewHistory')
+                ->label('View history')
+                ->icon('heroicon-o-clock')
+                ->url(ImportHistoryDetailPage::getUrl(['session' => $this->sessionId]))
+                ->visible(fn (): bool => in_array($this->progress['status'] ?? null, [
+                    ImportStatus::Completed->value,
+                    ImportStatus::Failed->value,
+                    ImportStatus::Cancelled->value,
+                ], true)),
         ];
     }
 }

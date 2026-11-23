@@ -40,7 +40,7 @@ The Hub Inbox also provides a **Discover files** action for the currently authen
 
 The method returns only newly registered records. It is safe to call again: each accepted record retains the canonical inbox path, while `claimed_storage_path` points to its private processing or quarantine copy. Discovery leaves importer assignment and both staging and execution untouched. Identical accepted content under a different path is retained and linked through `possible_duplicate_of`; the Hub displays it for review.
 
-An operator can reject an unstarted or review-ready session with a required reason, moving its retained private source to `rejected/`, or archive an eligible inactive session into `archive/`. These actions preserve the canonical source path, hash, and size; they never delete the source. Active staging/import work cannot be rejected or archived. Rejected and archived sessions cannot be assigned, staged, or queued.
+An operator can reject an unstarted or review-ready session with a required reason, moving its retained private source to `rejected/`, or archive an eligible inactive session into `archive/`. These actions preserve the canonical source path, hash, and size; they never delete the source. Active staging/import work cannot be rejected or archived. Rejected and archived sessions are read-only for import purposes: they cannot be assigned, staged, previewed, confirmed, retried, or executed. Progress, history, row details, and exports remain available. Archiving does not support an unarchive transition; create a new intake to import the file again.
 
 To schedule periodic discovery, the host application can register the command with its Laravel scheduler and an explicit service-user ID:
 

@@ -348,6 +348,7 @@ The default actor-owned scopes make sessions and presets private to their creato
 - Recovery is separate from queue retry limits. Run `smart-import:recover` periodically from your scheduler after confirming workers are running.
 - Completion, failure, and cancellation notifications use a durable outbox. Schedule `smart-import:deliver-outbox`; delivery is at least once, and listeners must deduplicate using the stable event key.
 - Retention commands are inspection-only. The package does not delete source files, row payloads, or audit history.
+- Archived or rejected intake is read-only for imports: it cannot be staged, previewed, confirmed, retried, or executed. History, row details, progress, and exports remain available.
 - Keep package tables and target models on one database connection. Execution rejects mixed connections before writing.
 
 ## Current limitations

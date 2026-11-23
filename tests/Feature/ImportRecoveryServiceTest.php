@@ -96,6 +96,29 @@ class ImportRecoveryServiceTest extends TestCase
     }
 
     #[Test]
+    public function archived_and_rejected_sessions_are_skipped_by_recovery(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $archived = $this->confirm($actor, "Ada,ada@example.test,token,Sales\n");
+        $rejected = $this->confirm($actor, "Grace,grace@example.test,token,Support\n");
+
+        ImportSession::query()->whereKey($archived->getKey())->update([
+            'intake_status' => 'archived',
+            'heartbeat_at' => now()->subHour(),
+        ]);
+        ImportSession::query()->whereKey($rejected->getKey())->update([
+            'intake_status' => 'rejected',
+            'heartbeat_at' => now()->subHour(),
+        ]);
+        Queue::fake();
+
+        $counts = app(ImportRecoveryService::class)->recoverStale();
+
+        $this->assertSame(0, $counts['scanned']);
+        Queue::assertNothingPushed();
+    }
+
+    #[Test]
     public function inconsistent_durable_counters_fail_safely_without_dispatching_rows(): void
     {
         $actor = new GenericUser(['id' => 7]);

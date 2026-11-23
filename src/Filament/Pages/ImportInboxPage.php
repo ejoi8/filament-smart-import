@@ -320,7 +320,9 @@ final class ImportInboxPage extends ImportHubPage implements HasTable
 
     private function canReview(ImportSession $record): bool
     {
-        if ($record->status !== ImportStatus::ReviewReady || $record->importer_key === null) {
+        if ($record->status !== ImportStatus::ReviewReady
+            || $record->importer_key === null
+            || in_array($record->intake_status, [IntakeStatus::Rejected, IntakeStatus::Archived], true)) {
             return false;
         }
 
