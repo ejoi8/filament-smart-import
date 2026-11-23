@@ -141,22 +141,59 @@ final class ImportPayloadCodec
     /** @param array<int|string, mixed>|null $stored @return list<int|string> */
     public function keys(?array $stored): array
     {
-        if ($stored === null || ! array_key_exists(self::MARKER, $stored)
-            || ! is_array($stored['encrypted'] ?? null)
-            || ! is_array($stored['plain'] ?? null)) {
-            return array_keys($stored ?? []);
+        if ($stored === null) {
+            return [];
         }
 
-        $keys = array_keys($stored['plain']);
+        if (! array_key_exists(self::MARKER, $stored)
+            || ! array_key_exists('order', $stored)
+            || ! array_key_exists('plain', $stored)
+            || ! array_key_exists('encrypted', $stored)) {
+            return array_keys($stored);
+        }
+
+        if (($stored[self::MARKER] ?? null) !== self::VERSION
+            || ! is_array($stored['order'] ?? null)
+            || ! is_array($stored['plain'] ?? null)
+            || ! is_array($stored['encrypted'] ?? null)) {
+            throw new DomainException('The encrypted staged values use an unsupported payload version.');
+        }
+
+        $available = [];
+
+        foreach (array_keys($stored['plain']) as $key) {
+            $available[$key] = true;
+        }
 
         foreach ($stored['encrypted'] as $entry) {
             if (! is_array($entry) || ! is_string($entry['key'] ?? null)) {
                 continue;
             }
 
-            $keys[] = ($entry['key_type'] ?? null) === 'integer' ? (int) $entry['key'] : $entry['key'];
+            $key = ($entry['key_type'] ?? null) === 'integer' ? (int) $entry['key'] : $entry['key'];
+            $available[$key] = true;
         }
 
-        return $keys;
+        $ordered = [];
+
+        foreach ($stored['order'] as $entry) {
+            if (! is_array($entry)
+                || ! in_array($entry['type'] ?? null, ['integer', 'string'], true)
+                || ! is_string($entry['key'] ?? null)) {
+                throw new DomainException('The encrypted staged values have an invalid field order.');
+            }
+
+            $key = $entry['type'] === 'integer' ? (int) $entry['key'] : $entry['key'];
+
+            if (array_key_exists($key, $available)) {
+                $ordered[$key] = true;
+            }
+        }
+
+        foreach ($available as $key => $_available) {
+            $ordered[$key] = true;
+        }
+
+        return array_keys($ordered);
     }
 }

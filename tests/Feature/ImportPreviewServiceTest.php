@@ -124,6 +124,34 @@ class ImportPreviewServiceTest extends TestCase
     }
 
     #[Test]
+    public function review_rows_preserve_mapped_field_order_and_importer_labels(): void
+    {
+        $actor = new GenericUser(['id' => 7]);
+        $session = $this->stage("Name,Email,API token,Department\nAda,ada@example.test,PRIVATE-TOKEN,Sales\n", $actor);
+        $service = $this->app->make(ImportPreviewService::class);
+        $service->generate((string) $session->getKey(), $actor);
+
+        $page = $service->rows((string) $session->getKey(), $actor);
+        $row = $page['rows'][0];
+
+        $this->assertSame(['name', 'email', 'api_token', 'department'], array_keys($row['mapped_values']));
+        $this->assertSame('[redacted]', $row['mapped_values']['api_token']);
+        $this->assertSame('Name', $page['field_labels']['name']);
+        $this->assertSame('API token', $page['field_labels']['api_token']);
+        $this->assertSame('Department', $page['field_labels']['department']);
+
+        Gate::define('viewSensitiveImportFields', fn ($user, $authorizedSession, $field): bool =>
+            $authorizedSession->is($session)
+            && $field->name === 'api_token'
+        );
+
+        $revealed = $service->rows((string) $session->getKey(), $actor)['rows'][0];
+
+        $this->assertSame(['name', 'email', 'api_token', 'department'], array_keys($revealed['mapped_values']));
+        $this->assertSame('PRIVATE-TOKEN', $revealed['mapped_values']['api_token']);
+    }
+
+    #[Test]
     public function sensitive_preview_values_are_revealed_only_with_the_field_gate(): void
     {
         $target = $this->target([

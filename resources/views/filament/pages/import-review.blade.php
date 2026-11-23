@@ -137,7 +137,7 @@
                             <dl class="mt-4 grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
                                 @foreach ($row['mapped_values'] as $field => $value)
                                     <div class="min-w-0">
-                                        <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ str($field)->headline() }}</dt>
+                                        <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ $review['field_labels'][$field] ?? str($field)->headline() }}</dt>
                                         <dd class="mt-1 break-words text-sm text-gray-950 dark:text-white">{{ is_scalar($value) ? $value : json_encode($value) }}</dd>
                                     </div>
                                 @endforeach
@@ -147,7 +147,7 @@
                         @if ($row['validation_errors'] !== [])
                             <ul class="mt-4 list-inside list-disc space-y-1 text-sm text-danger-700 dark:text-danger-300" aria-label="Validation errors for source row {{ $row['source_row_number'] }}">
                                 @foreach ($row['validation_errors'] as $error)
-                                    <li>{{ $error['field'] === null ? '' : str($error['field'])->headline().': ' }}{{ $error['message'] }}</li>
+                                    <li>{{ $error['field'] === null ? '' : (($review['field_labels'][$error['field']] ?? str($error['field'])->headline()).': ') }}{{ $error['message'] }}</li>
                                 @endforeach
                             </ul>
                         @endif

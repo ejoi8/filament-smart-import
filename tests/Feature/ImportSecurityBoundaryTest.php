@@ -33,6 +33,58 @@ class ImportSecurityBoundaryTest extends TestCase
         $this->assertSame($legacy, app(ImportPayloadCodec::class)->reveal($legacy));
         $this->assertSame(['name' => 'Ada'], app(ImportPayloadCodec::class)->reveal($legacy, ['name']));
         $this->assertSame([], app(ImportPayloadCodec::class)->reveal($legacy, []));
+        $this->assertSame(['name', 'secret'], app(ImportPayloadCodec::class)->keys($legacy));
+    }
+
+    #[Test]
+    public function payload_key_order_is_preserved_for_mixed_sensitive_and_plain_cells(): void
+    {
+        $codec = app(ImportPayloadCodec::class);
+        $stored = $codec->protect([
+            'token' => 'PRIVATE-TOKEN',
+            'name' => 'Ada',
+            'note' => 'visible note',
+            'email' => 'ada@example.test',
+        ], ['token']);
+
+        $this->assertSame(['token', 'name', 'note', 'email'], $codec->keys($stored));
+        $this->assertSame(['token', 'name', 'note', 'email'], array_keys($codec->reveal($stored)));
+    }
+
+    #[Test]
+    public function payload_key_order_preserves_integer_source_positions(): void
+    {
+        $codec = app(ImportPayloadCodec::class);
+        $stored = $codec->protect([1 => 'name', 2 => 'PRIVATE-TOKEN', 3 => 'note'], [2]);
+
+        $this->assertSame([1, 2, 3], $codec->keys($stored));
+        $this->assertSame([1, 2, 3], array_keys($codec->reveal($stored)));
+    }
+
+    #[Test]
+    public function payload_key_order_fails_closed_for_unsupported_versions(): void
+    {
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('The encrypted staged values use an unsupported payload version.');
+        app(ImportPayloadCodec::class)->keys([
+            '__smart_import_payload_version' => 99,
+            'order' => [],
+            'plain' => [],
+            'encrypted' => [],
+        ]);
+    }
+
+    #[Test]
+    public function payload_key_order_fails_closed_for_invalid_entries(): void
+    {
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('The encrypted staged values have an invalid field order.');
+        app(ImportPayloadCodec::class)->keys([
+            '__smart_import_payload_version' => 1,
+            'order' => [['type' => 'unsupported', 'key' => 'name']],
+            'plain' => ['name' => 'Ada'],
+            'encrypted' => [],
+        ]);
     }
 
     #[Test]

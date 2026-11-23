@@ -383,7 +383,15 @@ final class ImportPreviewService
     /**
      * Return one authorized page of persisted preview rows without exposing staged raw values.
      *
-     * @return array{staging_revision: int, page: int, per_page: int, total: int, last_page: int, rows: list<array<string, mixed>>}
+     * @return array{
+     *     staging_revision: int,
+     *     field_labels: array<string, string>,
+     *     page: int,
+     *     per_page: int,
+     *     total: int,
+     *     last_page: int,
+     *     rows: list<array<string, mixed>>
+     * }
      */
     public function rows(
         string $sessionId,
@@ -446,10 +454,12 @@ final class ImportPreviewService
             ]);
         $sensitiveAccess = $this->sensitiveFieldAccess($definition, $session, $actor);
         $fields = [];
+        $fieldLabels = [];
 
         foreach ($definition->fields() as $field) {
             if ($field instanceof ImportField) {
                 $fields[$field->name] = $field;
+                $fieldLabels[$field->name] = $field->label;
             }
         }
 
@@ -530,6 +540,7 @@ final class ImportPreviewService
                 'warnings' => (int) $session->stage_warning,
                 'excluded' => (int) $session->rows()->where('execution_status', 'excluded')->count(),
             ],
+            'field_labels' => $fieldLabels,
             'page' => $page,
             'per_page' => $perPage,
             'total' => $total,
